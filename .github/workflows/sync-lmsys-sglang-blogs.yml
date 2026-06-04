@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   sync:
-    if: github.repository == 'sgl-project/sglang' && github.ref == 'refs/heads/main'
+    if: github.repository == 'zijiexia/sglang' && github.ref == 'refs/heads/test/lmsys-blog-cards-demo'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -51,9 +51,9 @@ jobs:
 
           # Open a PR only if one is not already open for this branch; otherwise
           # the force-push above has already updated the existing PR in place.
-          if [ -z "$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[].number')" ]; then
+          if [ -z "$(gh pr list --head "$BRANCH" --base test/lmsys-blog-cards-demo --state open --json number --jq '.[].number')" ]; then
             gh pr create \
-              --base main \
+              --base test/lmsys-blog-cards-demo \
               --head "$BRANCH" \
               --title "docs: sync LMSYS SGLang blog cards" \
               --body 'Automated sync of the LMSYS SGLang blog cards in `docs_new/index.mdx`, opened by the `Sync LMSYS SGLang blogs` workflow.'
