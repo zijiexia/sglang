@@ -138,6 +138,12 @@ def benchmark_config(
                 num_experts, shard_intermediate_size, dtype=torch.float32
             )
             w2_scale = torch.randn(num_experts, hidden_size, dtype=torch.float32)
+        elif block_shape is None and per_channel_quant:
+            # fp8 per-channel weight scales (+ per-token dynamic activation, quantized in-kernel)
+            w1_scale = torch.randn(
+                num_experts, 2 * shard_intermediate_size, dtype=torch.float32
+            )
+            w2_scale = torch.randn(num_experts, hidden_size, dtype=torch.float32)
         elif block_shape is None:
             w1_scale = torch.randn(num_experts, dtype=torch.float32)
             w2_scale = torch.randn(num_experts, dtype=torch.float32)

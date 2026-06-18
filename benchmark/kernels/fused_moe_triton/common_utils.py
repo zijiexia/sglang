@@ -55,8 +55,11 @@ def get_model_config(
         first_group = next(iter(config_groups.values()), {})
         weights_config = first_group.get("weights", {})
         group_size = weights_config.get("group_size")
-        block_shape = [0, group_size]
-        assert len(block_shape) == 2
+        if group_size is not None:
+            block_shape = [0, group_size]
+            assert len(block_shape) == 2
+        # per-channel / per-tensor compressed-tensors (group_size is None):
+        # leave block_shape = None so the fp8 per-channel path is used (not block-scale).
     # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
     if hasattr(config, "text_config"):
         config = config.get_text_config()
@@ -148,6 +151,13 @@ def get_model_config(
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
+    elif architecture in [
+        "Cohere2VisionForConditionalGeneration",
+        "Cohere2MoeForCausalLM",
+    ]:
+        E = config.num_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.intermediate_size
     else:
         # Default: Mixtral
         E = config.num_local_experts // ep_size
