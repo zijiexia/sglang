@@ -362,7 +362,9 @@ def fill_referenced_subpage_mask(
     """
     num_dst_pages = mask.shape[0]
     mask.zero_()
-    mask[0] = 1
+    # fill_ takes the value as a kernel argument; `mask[0] = 1` would be an
+    # H2D copy of a CPU scalar, which CUDA graph capture rejects.
+    mask[:1].fill_(1)
     sub = token_indices.reshape(-1).to(torch.int64).div(_PBS_DST, rounding_mode="floor")
     sub = sub.clamp_(min=0, max=num_dst_pages - 1)
     mask.scatter_(0, sub, 1)
