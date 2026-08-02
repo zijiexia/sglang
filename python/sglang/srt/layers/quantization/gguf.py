@@ -561,6 +561,18 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         # Stack the per-expert shards collected by FusedMoE._load_gguf_weight
         # into the real w13_qweight/w2_qweight parameters.
         layer.materialize_gguf_weights()
+        for param_name in ("w13_qweight", "w2_qweight"):
+            param = getattr(layer, param_name)
+            if isinstance(param, UninitializedParameter):
+                raise ValueError(
+                    f"No GGUF expert shards were loaded into {param_name}."
+                )
+            if param.shape[0] != param.tensor_shape[0]:
+                raise ValueError(
+                    f"{param_name} materialized {param.shape[0]} of "
+                    f"{param.tensor_shape[0]} experts; the GGUF checkpoint is "
+                    "missing expert shards."
+                )
 
     def apply(
         self,

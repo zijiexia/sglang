@@ -429,6 +429,20 @@ def deepseek4_gguf_weights_iterator(
                 f"ffn_up_exps is {types['up'].name}; the fused w13 GGUF MoE "
                 "weight requires one quantization type for both."
             )
+    # Fail fast on incomplete files (wrong variant, bad conversion) instead of
+    # loading partially and warning about uninitialized parameters.
+    present = {t.name for t in reader.tensors}
+    missing = sorted(set(rules) - present) + sorted(
+        f"blk.{l}.ffn_{proj}_exps.weight"
+        for l in range(hf_config.num_hidden_layers)
+        for proj in ("gate", "up", "down")
+        if proj not in moe_exps_types.get(l, {})
+    )
+    if missing:
+        raise ValueError(
+            f"deepseek4 GGUF is missing {len(missing)} expected tensors "
+            f"(first few: {missing[:5]})."
+        )
 
     # First pass: quantization-type markers.
     for tensor in reader.tensors:
@@ -440,7 +454,7 @@ def deepseek4_gguf_weights_iterator(
                 yield (
                     f"model.layers.{layer_id}.mlp.experts.{expert_id}."
                     f"{_MOE_SHARD_NAMES[proj]}.qweight_type",
-                    torch.tensor(tensor.tensor_type),
+                    torch.tensor(_normalized_quant_type(tensor.tensor_type)),
                 )
             continue
         rule = rules[tensor.name]
@@ -457,10 +471,18 @@ def deepseek4_gguf_weights_iterator(
             layer_id, proj = int(moe_match.group(1)), moe_match.group(2)
             num_experts = tensor.data.shape[0]
             for expert_id in range(num_experts):
+                # Zero-copy views into the file mmap: the per-expert shards
+                # are staged in FusedMoE data containers until materialization
+                # and copying them here would hold the whole ~75GB expert
+                # payload in anonymous host memory (OOM on unified-memory
+                # boxes). mmap pages are clean and evictable instead.
+                expert_weight = _from_readonly_numpy(tensor.data[expert_id])
+                if tensor.tensor_type.name == "F16":
+                    expert_weight = expert_weight.to(torch.bfloat16)
                 yield (
                     f"model.layers.{layer_id}.mlp.experts.{expert_id}."
                     f"{_MOE_SHARD_NAMES[proj]}.qweight",
-                    torch.tensor(tensor.data[expert_id]),
+                    expert_weight,
                 )
             continue
         rule = rules[tensor.name]
@@ -482,3 +504,18 @@ def deepseek4_gguf_weights_iterator(
             yield rule.target, weight.to(torch.bfloat16)
         else:
             yield rule.target, torch.tensor(tensor.data)
+
+
+def _from_readonly_numpy(array) -> torch.Tensor:
+    """torch.from_numpy on a read-only mmap view, without the per-call warning.
+
+    The resulting tensor is only ever read (stacked/copied into materialized
+    parameters), never written.
+    """
+    import warnings
+
+    import torch
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*not writable.*")
+        return torch.from_numpy(array)

@@ -502,7 +502,13 @@ def get_tokenizer(
                     "The deepseek4 GGUF embedded tokenizer is only available "
                     "as a fast tokenizer; ignoring the slow-tokenizer request."
                 )
-            return build_tokenizer_from_gguf(tokenizer_name, **kwargs)
+            tokenizer = build_tokenizer_from_gguf(tokenizer_name, **kwargs)
+            # Serving code reads these attributes unconditionally; apply the
+            # same post-load patches as _apply_post_load_fixes, minus the v5
+            # from_pretrained artifact fixes that re-read HF checkpoint files.
+            _fix_special_tokens_pattern(tokenizer)
+            attach_additional_stop_token_ids(tokenizer)
+            return patch_tokenizer(tokenizer)
 
     tokenizer_name = _resolve_tokenizer_name(tokenizer_name, kwargs)
 

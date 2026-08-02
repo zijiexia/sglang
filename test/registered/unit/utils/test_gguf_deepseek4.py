@@ -351,6 +351,18 @@ class TestGGUFDeepseek4(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "quantization type"):
             next(deepseek4_gguf_weights_iterator(mixed_path, config))
 
+    def test_weights_iterator_rejects_missing_tensors(self):
+        """An incomplete file (wrong variant, truncated conversion) must fail
+        fast instead of loading partially with uninitialized parameters."""
+        config = build_config_from_gguf(self.gguf_path)
+        sparse_path = str(Path(self._tmpdir.name) / "missing_tensors.gguf")
+        _write_minimal_gguf(
+            sparse_path,
+            [("token_embd.weight", np.zeros((V, H), dtype=np.float16), None)],
+        )
+        with self.assertRaisesRegex(ValueError, "missing"):
+            next(deepseek4_gguf_weights_iterator(sparse_path, config))
+
 
 if __name__ == "__main__":
     unittest.main()
