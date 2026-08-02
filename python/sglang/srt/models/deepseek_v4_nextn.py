@@ -38,6 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v4 import (
+    _FP8_WO_A_GEMM,
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     _is_gguf_quant,
@@ -223,6 +224,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         # This __init__ bypasses DeepseekV4ForCausalLM.__init__, so mirror the
         # attributes the inherited load_weights/post_load_weights read.
         self.is_gguf_quant = _is_gguf_quant(quant_config)
+        self.wo_a_fp8 = _FP8_WO_A_GEMM and not self.is_gguf_quant
         self.determine_num_fused_shared_experts()
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:

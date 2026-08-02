@@ -1,8 +1,9 @@
-"""Unit tests for sglang.srt.utils.hf_transformers.gguf_deepseek4.
+"""Unit tests for the sglang-side GGUF architecture interop.
 
 Builds a tiny synthetic ``deepseek4`` GGUF (the llama.cpp architecture of
-DeepSeek V4 checkpoints) and exercises the sglang-side config builder,
-tokenizer builder, tensor-rule map, and weights iterator against it.
+DeepSeek V4 checkpoints) and exercises the ``gguf_arch`` registry dispatch
+plus the deepseek4 adapter: config builder, tokenizer builder, tensor-rule
+map, and weights iterator.
 """
 
 import tempfile
@@ -14,6 +15,10 @@ import numpy as np
 import torch
 from gguf.quants import quantize
 
+from sglang.srt.utils.hf_transformers.gguf_arch import (
+    get_gguf_arch_adapter,
+    read_gguf_architecture,
+)
 from sglang.srt.utils.hf_transformers.gguf_deepseek4 import (
     _MOE_EXPS_RE,
     GGUF_ARCH,
@@ -21,7 +26,6 @@ from sglang.srt.utils.hf_transformers.gguf_deepseek4 import (
     build_tokenizer_from_gguf,
     deepseek4_gguf_weights_iterator,
     deepseek4_tensor_rules,
-    read_gguf_architecture,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -182,6 +186,26 @@ class TestGGUFDeepseek4(CustomTestCase):
 
     def test_read_architecture(self):
         self.assertEqual(read_gguf_architecture(self.gguf_path), GGUF_ARCH)
+
+    def test_arch_registry_dispatch(self):
+        """The three GGUF dispatch sites key on this registry; a deepseek4
+        file must resolve to the adapter and unknown architectures must not
+        (they fall through to the transformers GGUF path)."""
+        adapter = get_gguf_arch_adapter(self.gguf_path)
+        self.assertIsNotNone(adapter)
+        self.assertEqual(adapter.gguf_arch, GGUF_ARCH)
+        self.assertIs(adapter.build_config, build_config_from_gguf)
+
+        other_arch_path = str(Path(self._tmpdir.name) / "other_arch.gguf")
+        w = gguf.GGUFWriter(other_arch_path, "llama")
+        w.add_tensor("token_embd.weight", np.zeros((4, 4), dtype=np.float32))
+        w.write_header_to_file()
+        w.write_kv_data_to_file()
+        w.write_tensors_to_file()
+        w.close()
+        self.assertIsNone(get_gguf_arch_adapter(other_arch_path))
+        # Unreadable files probe to None rather than raising.
+        self.assertIsNone(get_gguf_arch_adapter(str(Path(self._tmpdir.name) / "nope")))
 
     def test_build_config(self):
         config = build_config_from_gguf(self.gguf_path)
@@ -350,6 +374,26 @@ class TestGGUFDeepseek4(CustomTestCase):
         )
         with self.assertRaisesRegex(ValueError, "quantization type"):
             next(deepseek4_gguf_weights_iterator(mixed_path, config))
+
+    def test_tokenizer_rejects_unknown_pre_tokenizer(self):
+        """An unrecognized tokenizer.ggml.pre must fail loudly: falling back
+        to the generic GPT-2 split regex silently mis-tokenizes."""
+        weird_path = str(Path(self._tmpdir.name) / "weird_pre.gguf")
+        w = gguf.GGUFWriter(weird_path, GGUF_ARCH)
+        w.add_string("tokenizer.ggml.model", "gpt2")
+        w.add_string("tokenizer.ggml.pre", "some-new-pre")
+        w.add_array("tokenizer.ggml.tokens", ["<s>", "</s>", "t", "o", "to"])
+        w.add_array("tokenizer.ggml.token_type", [3, 3, 1, 1, 1])
+        w.add_array("tokenizer.ggml.merges", ["t o"])
+        w.add_uint32("tokenizer.ggml.bos_token_id", 0)
+        w.add_uint32("tokenizer.ggml.eos_token_id", 1)
+        w.add_tensor("token_embd.weight", np.zeros((5, 4), dtype=np.float32))
+        w.write_header_to_file()
+        w.write_kv_data_to_file()
+        w.write_tensors_to_file()
+        w.close()
+        with self.assertRaisesRegex(ValueError, "tokenizer.ggml.pre"):
+            build_tokenizer_from_gguf(weird_path)
 
     def test_weights_iterator_rejects_missing_tensors(self):
         """An incomplete file (wrong variant, truncated conversion) must fail

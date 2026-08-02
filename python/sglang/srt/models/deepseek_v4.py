@@ -2493,6 +2493,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.is_gguf_quant = _is_gguf_quant(quant_config)
+        # Model-level resolution of the fp8 wo_a GEMM mode; per-layer attention
+        # modules derive the same value unless constructed with an explicit
+        # wo_a_fp8 override (models doing that carry their own load path).
+        self.wo_a_fp8 = _FP8_WO_A_GEMM and not self.is_gguf_quant
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -2673,7 +2677,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
-        if _FP8_WO_A_GEMM and not self.is_gguf_quant:
+        if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
 
         if is_nextn:
@@ -2830,7 +2834,10 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         is_gguf = self.is_gguf_quant
 
-        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+        # The streaming dequant turns fp8-formatted checkpoint wo_a into bf16
+        # when the fp8 GEMM mode is off; GGUF checkpoints never carry
+        # fp8-formatted wo_a, so skip the (inert but buffering) wrapper.
+        if not self.wo_a_fp8 and not is_gguf:
             weights = _dequant_fp8_wo_a_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
@@ -2880,8 +2887,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             weight_names = []
             for name, loaded_weight in weights:
                 if (
-                    _FP8_WO_A_GEMM
-                    and not is_gguf
+                    self.wo_a_fp8
                     and name.endswith(".wo_a.weight")
                     and loaded_weight.dtype != torch.float8_e4m3fn
                 ):

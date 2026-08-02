@@ -220,7 +220,9 @@ def fused_moe_gguf(
             if swiglu_limit is not None:
                 # Same clamped-SwiGLU kernel as the unquantized DeepSeek V4
                 # path (models/deepseek_v2.py), so numerics match.
-                from sglang.kernels.ops.attention.dsv4.moe import silu_and_mul_clamp
+                from sglang.kernels.ops.activation.clamped_swiglu import (
+                    silu_and_mul_clamp,
+                )
 
                 out = torch.empty(
                     (x.shape[0], x.shape[1] // 2), dtype=x.dtype, device=x.device

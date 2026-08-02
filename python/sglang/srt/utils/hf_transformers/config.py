@@ -233,14 +233,12 @@ def get_config(
         _ensure_gguf_version()
 
         # Architectures transformers' GGUF integration doesn't know get an
-        # sglang-side config builder instead (currently only deepseek4).
-        from sglang.srt.utils.hf_transformers.gguf_deepseek4 import (
-            build_config_from_gguf,
-            is_deepseek4_gguf,
-        )
+        # sglang-side config builder instead.
+        from sglang.srt.utils.hf_transformers.gguf_arch import get_gguf_arch_adapter
 
-        if is_deepseek4_gguf(model):
-            config = build_config_from_gguf(model)
+        gguf_arch_adapter = get_gguf_arch_adapter(model)
+        if gguf_arch_adapter is not None:
+            config = gguf_arch_adapter.build_config(model)
             if model_override_args:
                 config.update(model_override_args)
             return config

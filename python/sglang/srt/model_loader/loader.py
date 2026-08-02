@@ -3051,17 +3051,14 @@ class GGUFModelLoader(BaseModelLoader):
     ) -> nn.Module:
 
         local_model_path = self._prepare_weights(model_config.model_path)
-        from sglang.srt.utils.hf_transformers.gguf_deepseek4 import (
-            MODEL_TYPE as _DEEPSEEK4_MODEL_TYPE,
-        )
-        from sglang.srt.utils.hf_transformers.gguf_deepseek4 import (
-            deepseek4_gguf_weights_iterator,
-        )
+        from sglang.srt.utils.hf_transformers.gguf_arch import get_gguf_arch_adapter
 
-        if model_config.hf_config.model_type == _DEEPSEEK4_MODEL_TYPE:
-            # The PyPI gguf package's name map doesn't know the deepseek4
-            # arch; sglang vendors the mapping (config sets tie_word_embeddings).
-            weights_iterator = deepseek4_gguf_weights_iterator(
+        gguf_arch_adapter = get_gguf_arch_adapter(local_model_path)
+        if gguf_arch_adapter is not None:
+            # Architectures the PyPI gguf package's name map doesn't know use
+            # the adapter's vendored mapping (the adapter's config builder is
+            # responsible for tie_word_embeddings).
+            weights_iterator = gguf_arch_adapter.weights_iterator(
                 local_model_path, model_config.hf_config
             )
         else:

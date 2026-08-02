@@ -66,28 +66,6 @@ class GGUFTensorRule(msgspec.Struct, frozen=True):
     mode: Literal["quant", "raw", "dequant_bf16"]
 
 
-def read_gguf_architecture(gguf_path: str) -> str:
-    """Return ``general.architecture`` of a GGUF file."""
-    import gguf
-
-    reader = gguf.GGUFReader(gguf_path)
-    return _read_field(reader, "general.architecture")
-
-
-def is_deepseek4_gguf(gguf_path: str) -> bool:
-    """True when the GGUF's architecture is ``deepseek4``.
-
-    A probe, not a validator: unreadable or arch-less files answer False so
-    callers fall through to the legacy transformers GGUF path (and keep its
-    error surface).
-    """
-    try:
-        return read_gguf_architecture(gguf_path) == GGUF_ARCH
-    except Exception as e:
-        logger.debug("Could not read GGUF architecture from %s: %s", gguf_path, e)
-        return False
-
-
 def _read_field(reader: gguf.GGUFReader, key: str):
     field = reader.get_field(key)
     if field is None:
@@ -248,11 +226,12 @@ def build_tokenizer_from_gguf(gguf_path: str, **kwargs) -> PreTrainedTokenizerFa
         # the official tokenizer.
         fast_tokenizer.pre_tokenizer = _deepseek_pre_tokenizer()
     else:
-        logger.warning(
-            "Unknown tokenizer.ggml.pre %r in deepseek4 GGUF; keeping the "
-            "generic GPT-2 pre-tokenizer. For guaranteed tokenization parity, "
-            "pass --tokenizer-path (e.g. deepseek-ai/DeepSeek-V4-Flash).",
-            pre,
+        # A wrong pre-tokenizer silently mis-tokenizes; refuse rather than
+        # fall back to the generic GPT-2 split regex.
+        raise ValueError(
+            f"Unknown tokenizer.ggml.pre {pre!r} in deepseek4 GGUF; pass "
+            "--tokenizer-path (e.g. deepseek-ai/DeepSeek-V4-Flash) to use the "
+            "original tokenizer instead of the embedded one."
         )
     tokens = tokenizer_dict["tokens"]
     chat_template_field = reader.get_field("tokenizer.chat_template")
