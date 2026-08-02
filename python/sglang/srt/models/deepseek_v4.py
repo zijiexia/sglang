@@ -3165,6 +3165,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             self._prewarm_mhc_pre_kernels()
 
     def get_embed_and_head(self):
+        if self.is_gguf_quant:
+            # The GGUF lm_head stores packed qweight bytes; speculative
+            # decoding workers need a dense lm_head.weight to share with the
+            # draft model.
+            raise NotImplementedError(
+                "Speculative decoding is not supported for GGUF-quantized "
+                "DeepSeek-V4 checkpoints."
+            )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
