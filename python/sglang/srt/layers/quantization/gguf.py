@@ -450,8 +450,10 @@ class GGUFLinearMethod(LinearMethodBase):
         shard_id = layer.qweight.shard_id
 
         if shard_id:
-            # dequantize shard weights respectively
-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+            # Dequantize shard weights respectively. Shards are recorded in
+            # checkpoint-file order; concatenate in canonical shard order
+            # (q/k/v, or the merged-linear output index) instead.
+            shard_id = ["q", "k", "v"] if "q" in shard_id else sorted(shard_id)
             qweight = layer.qweight
             result = []
             for idx in shard_id:
@@ -592,6 +594,14 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
         moe_runner_config = self.moe_runner_config
 
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        if not isinstance(topk_output, StandardTopKOutput):
+            raise ValueError(
+                f"GGUF MoE requires the standard TopK output, got "
+                f"{type(topk_output).__name__}; use a MoE runner backend that "
+                "does not bypass TopK (e.g. --moe-runner-backend auto)."
+            )
         topk_weights, topk_ids, _ = topk_output
         output = fused_moe_gguf(
             x=x,
@@ -604,6 +614,11 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             activation=moe_runner_config.activation,
             swiglu_limit=moe_runner_config.swiglu_limit,
         )
+        routed_scaling_factor = moe_runner_config.routed_scaling_factor
+        if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
+            # The MoE runners fold this into their final reduce; the GGUF
+            # kernels only weight by the (unscaled) topk weights.
+            output.mul_(routed_scaling_factor)
         return StandardCombineInput(hidden_states=output)
 
 
