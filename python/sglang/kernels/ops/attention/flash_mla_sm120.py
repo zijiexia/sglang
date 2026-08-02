@@ -352,11 +352,17 @@ def fill_referenced_subpage_mask(
 
     Page-split is an address-preserving re-layout, so a token index maps to
     sub-page ``index // 64``. Fixed-shape ops only (no host sync, no
-    data-dependent shapes) so decode stays CUDA-graph capturable. Out-of-range
-    padding entries clamp into range and at worst mark one extra sub-page.
+    data-dependent shapes) so decode stays CUDA-graph capturable.
+
+    Sub-page 0 is always marked: decode_dsv4_kernel.cuh substitutes slot 0 for
+    every invalid or past-the-end candidate (``idx = (idx_raw >= 0) ? idx_raw
+    : 0``) and still issues the bulk copy for it. Those lanes are masked to
+    -1e30 after the QK MMA, but the PV stage would still multiply them, so
+    leaving slot 0 as uninitialized bytes risks 0 * NaN reaching the output.
     """
     num_dst_pages = mask.shape[0]
     mask.zero_()
+    mask[0] = 1
     sub = token_indices.reshape(-1).to(torch.int64).div(_PBS_DST, rounding_mode="floor")
     sub = sub.clamp_(min=0, max=num_dst_pages - 1)
     mask.scatter_(0, sub, 1)
