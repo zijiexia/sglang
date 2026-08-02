@@ -376,24 +376,26 @@ class TestGGUFDeepseek4(CustomTestCase):
             next(deepseek4_gguf_weights_iterator(mixed_path, config))
 
     def test_tokenizer_rejects_unknown_pre_tokenizer(self):
-        """An unrecognized tokenizer.ggml.pre must fail loudly: falling back
-        to the generic GPT-2 split regex silently mis-tokenizes."""
-        weird_path = str(Path(self._tmpdir.name) / "weird_pre.gguf")
-        w = gguf.GGUFWriter(weird_path, GGUF_ARCH)
-        w.add_string("tokenizer.ggml.model", "gpt2")
-        w.add_string("tokenizer.ggml.pre", "some-new-pre")
-        w.add_array("tokenizer.ggml.tokens", ["<s>", "</s>", "t", "o", "to"])
-        w.add_array("tokenizer.ggml.token_type", [3, 3, 1, 1, 1])
-        w.add_array("tokenizer.ggml.merges", ["t o"])
-        w.add_uint32("tokenizer.ggml.bos_token_id", 0)
-        w.add_uint32("tokenizer.ggml.eos_token_id", 1)
-        w.add_tensor("token_embd.weight", np.zeros((5, 4), dtype=np.float32))
-        w.write_header_to_file()
-        w.write_kv_data_to_file()
-        w.write_tensors_to_file()
-        w.close()
-        with self.assertRaisesRegex(ValueError, "tokenizer.ggml.pre"):
-            build_tokenizer_from_gguf(weird_path)
+        """An unrecognized or absent tokenizer.ggml.pre must fail loudly:
+        falling back to the generic GPT-2 split regex silently mis-tokenizes."""
+        for name, pre in (("weird_pre.gguf", "some-new-pre"), ("no_pre.gguf", None)):
+            path = str(Path(self._tmpdir.name) / name)
+            w = gguf.GGUFWriter(path, GGUF_ARCH)
+            w.add_string("tokenizer.ggml.model", "gpt2")
+            if pre is not None:
+                w.add_string("tokenizer.ggml.pre", pre)
+            w.add_array("tokenizer.ggml.tokens", ["<s>", "</s>", "t", "o", "to"])
+            w.add_array("tokenizer.ggml.token_type", [3, 3, 1, 1, 1])
+            w.add_array("tokenizer.ggml.merges", ["t o"])
+            w.add_uint32("tokenizer.ggml.bos_token_id", 0)
+            w.add_uint32("tokenizer.ggml.eos_token_id", 1)
+            w.add_tensor("token_embd.weight", np.zeros((5, 4), dtype=np.float32))
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_tensors_to_file()
+            w.close()
+            with self.assertRaisesRegex(ValueError, "tokenizer.ggml.pre"):
+                build_tokenizer_from_gguf(path)
 
     def test_weights_iterator_rejects_missing_tensors(self):
         """An incomplete file (wrong variant, truncated conversion) must fail
