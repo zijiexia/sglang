@@ -487,6 +487,23 @@ def get_tokenizer(
         if "use_fast" not in kwargs:
             kwargs["use_fast"] = True
 
+    if check_gguf_file(tokenizer_name):
+        # GGUF architectures transformers' tokenizer integration rejects are
+        # loaded via the sglang-side converter (currently only deepseek4).
+        _ensure_gguf_version()
+        from sglang.srt.utils.hf_transformers.gguf_deepseek4 import (
+            build_tokenizer_from_gguf,
+            is_deepseek4_gguf,
+        )
+
+        if is_deepseek4_gguf(tokenizer_name):
+            if not kwargs.pop("use_fast", True):
+                logger.warning(
+                    "The deepseek4 GGUF embedded tokenizer is only available "
+                    "as a fast tokenizer; ignoring the slow-tokenizer request."
+                )
+            return build_tokenizer_from_gguf(tokenizer_name, **kwargs)
+
     tokenizer_name = _resolve_tokenizer_name(tokenizer_name, kwargs)
 
     common_kwargs = dict(

@@ -231,6 +231,20 @@ def get_config(
                 "with GGUF inputs; only 'hf' (or 'auto') is supported."
             )
         _ensure_gguf_version()
+
+        # Architectures transformers' GGUF integration doesn't know get an
+        # sglang-side config builder instead (currently only deepseek4).
+        from sglang.srt.utils.hf_transformers.gguf_deepseek4 import (
+            build_config_from_gguf,
+            is_deepseek4_gguf,
+        )
+
+        if is_deepseek4_gguf(model):
+            config = build_config_from_gguf(model)
+            if model_override_args:
+                config.update(model_override_args)
+            return config
+
         kwargs["gguf_file"] = model
         model = Path(model).parent
         # Skip auto-resolution for GGUF: the name-based Mistral heuristic

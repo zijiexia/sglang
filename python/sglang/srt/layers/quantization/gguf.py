@@ -213,9 +213,20 @@ def fused_moe_gguf(
     qweight_type: int,
     qweight_type2: int,
     activation: str,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     def act(x: torch.Tensor):
         if activation == "silu":
+            if swiglu_limit is not None:
+                # Same clamped-SwiGLU kernel as the unquantized DeepSeek V4
+                # path (models/deepseek_v2.py), so numerics match.
+                from sglang.kernels.ops.attention.dsv4.moe import silu_and_mul_clamp
+
+                out = torch.empty(
+                    (x.shape[0], x.shape[1] // 2), dtype=x.dtype, device=x.device
+                )
+                silu_and_mul_clamp(x, out, float(swiglu_limit))
+                return out
             return silu_and_mul(x)
         elif activation == "gelu":
             return gelu_and_mul(x)
@@ -538,6 +549,19 @@ class GGUFMoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
 
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        if layer.moe_tp_size > 1:
+            # FusedMoE._load_gguf_weight narrows raw packed bytes along dim 0
+            # for every shard, which is wrong for w2 (its packed input dim is
+            # dim 1); fail loudly instead of producing corrupted experts.
+            raise ValueError(
+                "GGUF MoE weights do not support tensor parallelism yet; "
+                "run with tp 1 (or EP so that experts are not TP-sharded)."
+            )
+        # Stack the per-expert shards collected by FusedMoE._load_gguf_weight
+        # into the real w13_qweight/w2_qweight parameters.
+        layer.materialize_gguf_weights()
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -566,6 +590,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             qweight_type=layer.w13_qweight_type.weight_type,
             qweight_type2=layer.w2_qweight_type.weight_type,
             activation=moe_runner_config.activation,
+            swiglu_limit=moe_runner_config.swiglu_limit,
         )
         return StandardCombineInput(hidden_states=output)
 

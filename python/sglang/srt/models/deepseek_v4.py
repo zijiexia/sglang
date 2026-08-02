@@ -205,6 +205,13 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
 ]
 
 
+def _is_gguf_quant(quant_config: Optional[QuantizationConfig]) -> bool:
+    # GGUF checkpoints ship separate wq_a/wkv packed-quant tensors and a
+    # non-fp8 wo_a, so the wqkv_a fusion and the fp8 wo_a GEMM env opt-ins
+    # cannot apply to them.
+    return quant_config is not None and quant_config.get_name() == "gguf"
+
+
 def _is_fused_mhc_post_pre_enabled() -> bool:
     # SM120 disables the standalone TileLang pre path. mhc_fused_post_pre does
     # not read that flag and dispatches independently for both small and large
@@ -436,10 +443,13 @@ class MqaAttentionBase(nn.Module):
         assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
 
+        is_gguf = _is_gguf_quant(quant_config)
         fuse: bool = (
-            envs.SGLANG_OPT_FUSE_WQA_WKV.get() if fuse_wqa_wkv is None else fuse_wqa_wkv
+            (envs.SGLANG_OPT_FUSE_WQA_WKV.get() and not is_gguf)
+            if fuse_wqa_wkv is None
+            else fuse_wqa_wkv
         )
-        fp8: bool = _FP8_WO_A_GEMM if wo_a_fp8 is None else wo_a_fp8
+        fp8: bool = (_FP8_WO_A_GEMM and not is_gguf) if wo_a_fp8 is None else wo_a_fp8
         reduce_results: bool = (
             (self.attn_tp_size == get_parallel().tp_size and self.attn_tp_size > 1)
             if wo_b_reduce_results is None
@@ -455,6 +465,7 @@ class MqaAttentionBase(nn.Module):
             wo_a_quant_config = None
 
         self.fuse_wqa_wkv = fuse
+        self.wo_a_fp8 = fp8
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self._attn_sink_local: Optional[torch.Tensor] = None
@@ -1309,7 +1320,7 @@ class MQALayer(MqaAttentionBase):
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
-        if _FP8_WO_A_GEMM:
+        if self.wo_a_fp8:
             import deep_gemm
 
             from sglang.srt.layers import deep_gemm_wrapper
@@ -2481,6 +2492,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
+        self.is_gguf_quant = _is_gguf_quant(quant_config)
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -2661,7 +2673,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
-        if _FP8_WO_A_GEMM:
+        if _FP8_WO_A_GEMM and not self.is_gguf_quant:
             self._setup_fp8_wo_a_scales(is_nextn)
 
         if is_nextn:
@@ -2816,6 +2828,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
+        is_gguf = self.is_gguf_quant
+
         if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
             weights = _dequant_fp8_wo_a_streaming(weights)
 
@@ -2836,7 +2850,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
-        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get() and not is_gguf
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
 
         def auto_weight_loader(module):
@@ -2867,6 +2881,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             for name, loaded_weight in weights:
                 if (
                     _FP8_WO_A_GEMM
+                    and not is_gguf
                     and name.endswith(".wo_a.weight")
                     and loaded_weight.dtype != torch.float8_e4m3fn
                 ):
@@ -2878,7 +2893,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                         "SGLANG_OPT_FP8_WO_A_GEMM=0."
                     )
                 try:
-                    use_async_loading = should_async_load(loaded_weight)
+                    # GGUF staging (data_container/expert_data_map appends,
+                    # merged-shard bookkeeping) is not thread-safe; load inline.
+                    use_async_loading = should_async_load(loaded_weight) and not is_gguf
 
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,
