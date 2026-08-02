@@ -296,6 +296,7 @@ _BYTES_PER_DST_PAGE_PADDED = math.ceil(_BYTES_PER_DST_PAGE / 576) * 576  # 37440
 def _page_split_kernel(
     src_ptr,
     dst_ptr,
+    referenced_ptr,
     N_pages,
     src_stride0: tl.constexpr,
     dst_stride0: tl.constexpr,
@@ -305,14 +306,24 @@ def _page_split_kernel(
     DST_SCALE_OFF: tl.constexpr,  # 64 * 576 = 36864
     RATIO: tl.constexpr,  # 4
     BLOCK_SIZE: tl.constexpr,
+    USE_REFERENCED: tl.constexpr,
 ):
-    """Fused page-split: copy data+scale for all sub-pages in one kernel."""
+    """Fused page-split: copy data+scale for all sub-pages in one kernel.
+
+    With ``USE_REFERENCED``, sub-pages this forward does not read are skipped:
+    the grid still spans the pool (so the launch stays CUDA-graph friendly),
+    but unreferenced programs exit before touching memory.
+    """
     pid = tl.program_id(0)
     page_idx = pid // RATIO
     sub = pid % RATIO
 
     if page_idx >= N_pages:
         return
+
+    if USE_REFERENCED:
+        if tl.load(referenced_ptr + pid) == 0:
+            return
 
     src_base = src_ptr + page_idx * src_stride0
     dst_base = dst_ptr + (page_idx * RATIO + sub) * dst_stride0
@@ -334,11 +345,45 @@ def _page_split_kernel(
         tl.store(dst_base + DST_SCALE_OFF + offs, vals, mask=mask)
 
 
-def _split_kv_pages_to_64(kv_u8: torch.Tensor, src_pbs: int) -> torch.Tensor:
+def _referenced_subpage_mask(
+    token_indices: torch.Tensor, num_dst_pages: int, device: torch.device
+) -> torch.Tensor:
+    """Mark the pbs=64 sub-pages the given token indices fall into.
+
+    Page-split is an address-preserving re-layout, so a token index maps to
+    sub-page ``index // 64``. Built with fixed-shape ops only (no host sync,
+    no data-dependent shapes) so decode stays CUDA-graph capturable. Padding
+    entries clamp into range and at worst mark one extra sub-page.
+    """
+    from sglang.srt.runtime_context import get_resources
+
+    buffers = get_resources().buffers
+    key = f"flash_mla_sm120_refmask:{device}"
+    mask = buffers.get(key)
+    if mask is None or mask.shape[0] < num_dst_pages:
+        mask = torch.zeros(num_dst_pages, dtype=torch.uint8, device=device)
+        buffers[key] = mask
+    mask = mask[:num_dst_pages]
+    mask.zero_()
+
+    sub = token_indices.reshape(-1).to(torch.int64).div(_PBS_DST, rounding_mode="floor")
+    sub = sub.clamp_(min=0, max=num_dst_pages - 1)
+    mask.scatter_(0, sub, 1)
+    return mask
+
+
+def _split_kv_pages_to_64(
+    kv_u8: torch.Tensor, src_pbs: int, token_indices: torch.Tensor | None = None
+) -> torch.Tensor:
     """Split pbs=N footer-format pages into pbs=64 footer-format pages.
 
     Uses a fused Triton kernel to do all sub-page copies in a single launch
     instead of 8 separate copy kernels (4 sub-pages × 2 regions).
+
+    ``token_indices`` (the sparse-attention indices this forward will read)
+    restricts the copy to the sub-pages actually referenced. The source is a
+    whole per-layer KV pool while a decode step reads only its top-k tokens,
+    so copying the pool wholesale dominated the attention time.
     """
     assert src_pbs % _PBS_DST == 0 and src_pbs >= _PBS_DST
     if src_pbs == _PBS_DST:
@@ -373,10 +418,18 @@ def _split_kv_pages_to_64(kv_u8: torch.Tensor, src_pbs: int) -> torch.Tensor:
     else:
         src_stride0 = src_2d.stride(0)
 
+    if token_indices is None:
+        referenced = out  # unused; triton still needs a valid pointer
+    else:
+        referenced = _referenced_subpage_mask(
+            token_indices=token_indices, num_dst_pages=num_dst_pages, device=dev
+        )
+
     grid = (N * ratio,)
     _page_split_kernel[grid](
         src_2d,
         out,
+        referenced,
         N,
         src_stride0,
         _BYTES_PER_DST_PAGE_PADDED,
@@ -386,6 +439,7 @@ def _split_kv_pages_to_64(kv_u8: torch.Tensor, src_pbs: int) -> torch.Tensor:
         _PBS_DST * _NOPE_ROPE_STRIDE,  # DST_SCALE_OFF = 36864
         ratio,  # RATIO = 4
         1024,  # BLOCK_SIZE
+        token_indices is not None,  # USE_REFERENCED
     )
 
     bpt = _NOPE_ROPE_STRIDE + _SCALE_STRIDE  # 584
@@ -425,9 +479,15 @@ def _flash_mla_flashinfer(
     dev = q.device
 
     # --- Page-split: convert pbs=N kv_cache to pbs=64 view ---
+    # Only the sub-pages `indices` selects are copied; k_cache is the whole
+    # per-layer pool, of which one forward reads at most topk tokens.
     kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
     src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
-    kv_64 = _split_kv_pages_to_64(kv_u8, src_pbs) if src_pbs != _PBS_DST else kv_u8
+    kv_64 = (
+        _split_kv_pages_to_64(kv_u8, src_pbs, token_indices=indices)
+        if src_pbs != _PBS_DST
+        else kv_u8
+    )
 
     extra_kv_u8 = (
         extra_k_cache.view(torch.uint8)
