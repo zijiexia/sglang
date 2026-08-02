@@ -579,8 +579,8 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        assert self.fused_experts is None
-
+        # (An `assert self.fused_experts is None` vestige of the vLLM port
+        # used to live here; sglang's FusedMoEMethodBase has no such field.)
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert (
