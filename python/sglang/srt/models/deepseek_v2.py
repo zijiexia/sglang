@@ -267,6 +267,12 @@ class DeepseekV2MLP(nn.Module):
         super().__init__()
         self.tp_size = tp_size
         self.swiglu_limit = swiglu_limit
+        # GGUF linears expose packed `qweight` instead of `weight`; the
+        # dtype-probing fast paths in forward() must not touch them (their
+        # packed bytes are uint8 and would masquerade as fp8 weights).
+        self.is_gguf_quant = (
+            quant_config is not None and quant_config.get_name() == "gguf"
+        )
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -352,6 +358,7 @@ class DeepseekV2MLP(nn.Module):
             if (
                 gemm_output_zero_allocator is not None
                 and x.shape[0] <= 256
+                and not self.is_gguf_quant
                 and self.gate_up_proj.weight.dtype == torch.uint8
             ):
                 y = gemm_output_zero_allocator.allocate(
@@ -366,6 +373,7 @@ class DeepseekV2MLP(nn.Module):
         if (
             self.swiglu_limit is not None
             and not self.down_proj.reduce_results
+            and not self.is_gguf_quant
             and self.down_proj.weight.dtype == torch.uint8
             and hasattr(self.down_proj, "weight_scale_inv")
         ):
@@ -777,6 +785,7 @@ class DeepseekV2MoE(nn.Module):
                 "awq",
                 "awq_marlin",
                 "moe_wna16",
+                "gguf",
             }
             self.shared_experts_is_int8 = (
                 not is_packed_weight
