@@ -345,16 +345,27 @@ def _page_split_kernel(
         tl.store(dst_base + DST_SCALE_OFF + offs, vals, mask=mask)
 
 
+def fill_referenced_subpage_mask(
+    mask: torch.Tensor, token_indices: torch.Tensor
+) -> torch.Tensor:
+    """Mark in ``mask`` the pbs=64 sub-pages ``token_indices`` falls into.
+
+    Page-split is an address-preserving re-layout, so a token index maps to
+    sub-page ``index // 64``. Fixed-shape ops only (no host sync, no
+    data-dependent shapes) so decode stays CUDA-graph capturable. Out-of-range
+    padding entries clamp into range and at worst mark one extra sub-page.
+    """
+    num_dst_pages = mask.shape[0]
+    mask.zero_()
+    sub = token_indices.reshape(-1).to(torch.int64).div(_PBS_DST, rounding_mode="floor")
+    sub = sub.clamp_(min=0, max=num_dst_pages - 1)
+    mask.scatter_(0, sub, 1)
+    return mask
+
+
 def _referenced_subpage_mask(
     token_indices: torch.Tensor, num_dst_pages: int, device: torch.device
 ) -> torch.Tensor:
-    """Mark the pbs=64 sub-pages the given token indices fall into.
-
-    Page-split is an address-preserving re-layout, so a token index maps to
-    sub-page ``index // 64``. Built with fixed-shape ops only (no host sync,
-    no data-dependent shapes) so decode stays CUDA-graph capturable. Padding
-    entries clamp into range and at worst mark one extra sub-page.
-    """
     from sglang.srt.runtime_context import get_resources
 
     buffers = get_resources().buffers
@@ -363,13 +374,9 @@ def _referenced_subpage_mask(
     if mask is None or mask.shape[0] < num_dst_pages:
         mask = torch.zeros(num_dst_pages, dtype=torch.uint8, device=device)
         buffers[key] = mask
-    mask = mask[:num_dst_pages]
-    mask.zero_()
-
-    sub = token_indices.reshape(-1).to(torch.int64).div(_PBS_DST, rounding_mode="floor")
-    sub = sub.clamp_(min=0, max=num_dst_pages - 1)
-    mask.scatter_(0, sub, 1)
-    return mask
+    return fill_referenced_subpage_mask(
+        mask=mask[:num_dst_pages], token_indices=token_indices
+    )
 
 
 def _split_kv_pages_to_64(
