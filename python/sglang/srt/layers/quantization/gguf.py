@@ -167,13 +167,46 @@ MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
 # Above this many tokens a quantized linear switches from the MMQ kernel to
-# dequant + bf16 GEMM (see the branch comment in fused_mul_mat_gguf). Kept at
-# the same order as the MoE _DEQUANT_GEMM_MIN_TOKENS so only prefill-sized
-# batches take it; decode and spec-verify widths stay on MMQ/MMVQ inside
-# captured CUDA graphs. Transient scratch = one dequantized weight (largest
-# non-lm_head DeepSeek-V4-Flash linear is wq_b, 64MB bf16; lm_head only sees
-# M >= 512 under full-prompt logprobs, a 1GB transient).
+# dequant + bf16 GEMM (see _use_linear_dequant_gemm). Kept at the same order
+# as the MoE _DEQUANT_GEMM_MIN_TOKENS so only prefill-sized batches take it.
 _LINEAR_DEQUANT_GEMM_MIN_TOKENS = 512
+
+# Ceiling on the transient dense-weight scratch the dequant+GEMM linear route
+# may allocate. Covers every DeepSeek-V4-Flash prefill linear (largest is
+# wq_b, 64MB bf16) while keeping vocabulary-sized weights on MMQ — e.g. a
+# prompt-logprob lm_head call (129280x4096 = 1.06GB bf16) must not allocate
+# a transient of that size.
+_LINEAR_DEQUANT_GEMM_MAX_SCRATCH_BYTES = 256 * 1024 * 1024
+
+# The dequant+GEMM linear route is enabled per (backend, quant type) only
+# where it has been benchmarked. CUDA GB10 evidence: Q8_0 MMQ runs at ~0.75
+# TFLOPS on M=2048 GEMMs (57.4% of DS4-Flash prefill GPU time) vs ~20-40x
+# faster as dequant + cuBLAS bf16 GEMM. Other types/backends keep MMQ until
+# they get their own measurements.
+_LINEAR_DEQUANT_GEMM_TYPES = frozenset({WeightType.Q8_0}) if _is_cuda else frozenset()
+
+
+def _use_linear_dequant_gemm(
+    x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
+) -> bool:
+    """Whether a quantized linear should take the dequant + bf16 GEMM route.
+
+    All four gates are required (BS-1 review hardening):
+    - measured (backend, type) allowlist,
+    - prefill-sized M,
+    - never inside CUDA-graph capture (capture must record the same kernels
+      replay will use; M alone does not discriminate forward modes),
+    - bounded dense-weight scratch (excludes lm_head-sized weights).
+    """
+    if qweight_type not in _LINEAR_DEQUANT_GEMM_TYPES:
+        return False
+    if x.shape[0] < _LINEAR_DEQUANT_GEMM_MIN_TOKENS:
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+    n_elements = qweight.shape[0] * (qweight.shape[1] // type_size * block_size)
+    return n_elements * x.element_size() <= _LINEAR_DEQUANT_GEMM_MAX_SCRATCH_BYTES
 
 
 def fused_mul_mat_gguf(
@@ -193,15 +226,11 @@ def fused_mul_mat_gguf(
     # enable MMVQ in contiguous batching with batch_size=1
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
-    # Prefill-sized batches: the MMQ kernel is a scalar-dp4a design that runs
-    # far below tensor-core GEMM rates at large M (measured 0.75 TFLOPS on the
-    # DeepSeek-V4-Flash shared-expert Q8_0 GEMMs at M=2048, 57% of prefill GPU
-    # time), while dequant traffic is a fixed ~2x weight-bytes. Dequantize and
-    # run a bf16 GEMM instead. Decode and spec-verify batches stay below the
-    # threshold, so captured CUDA graphs keep the MMQ/MMVQ kernels.
-    elif (
-        x.shape[0] >= _LINEAR_DEQUANT_GEMM_MIN_TOKENS and qweight_type in DEQUANT_TYPES
-    ):
+    # Prefill-sized batches on the measured allowlist: the MMQ kernel is a
+    # scalar-dp4a design that runs far below tensor-core GEMM rates at large
+    # M, while dequant traffic is a fixed ~2x weight-bytes. Dequantize and
+    # run a bf16 GEMM instead (gates in _use_linear_dequant_gemm).
+    elif _use_linear_dequant_gemm(x, qweight, qweight_type):
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
         weight = ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
