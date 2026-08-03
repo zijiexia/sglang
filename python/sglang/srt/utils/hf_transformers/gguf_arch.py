@@ -97,7 +97,7 @@ def _register_builtin_adapters() -> None:
     if _builtin_adapters_registered:
         return
 
-    from sglang.srt.utils.hf_transformers import gguf_deepseek4
+    from sglang.srt.utils.hf_transformers import gguf_deepseek4, gguf_deepseek4_dspark
 
     register_gguf_arch_adapter(
         GGUFArchAdapter(
@@ -105,6 +105,14 @@ def _register_builtin_adapters() -> None:
             build_config=gguf_deepseek4.build_config_from_gguf,
             build_tokenizer=gguf_deepseek4.build_tokenizer_from_gguf,
             weights_iterator=gguf_deepseek4.deepseek4_gguf_weights_iterator,
+        )
+    )
+    register_gguf_arch_adapter(
+        GGUFArchAdapter(
+            gguf_arch=gguf_deepseek4_dspark.GGUF_ARCH,
+            build_config=gguf_deepseek4_dspark.build_config_from_gguf,
+            build_tokenizer=gguf_deepseek4_dspark.build_tokenizer_from_gguf,
+            weights_iterator=gguf_deepseek4_dspark.dspark_gguf_weights_iterator,
         )
     )
     # Latched only after registration succeeds, so a failed import re-raises

@@ -278,6 +278,25 @@ def _deepseek_pre_tokenizer():
     )
 
 
+def _gguf_lm_head_is_dense() -> bool:
+    """Whether the target lm_head is built as a dense bf16 weight.
+
+    DSpark drafting shares the target's lm_head module and reads
+    ``lm_head.weight`` directly, so under ``--speculative-algorithm DSPARK``
+    the model builds it unquantized and this iterator dequantizes the Q8_0
+    payload. Falls back to the packed head when no runtime context exists
+    (unit tests exercise the iterator standalone).
+    """
+    from sglang.srt.runtime_context import get_server_args
+
+    try:
+        server_args = get_server_args()
+    except ValueError:
+        # "Global server args is not set yet!" — standalone iterator use.
+        return False
+    return server_args.speculative_algorithm == "DSPARK"
+
+
 def deepseek4_tensor_rules(hf_config: PretrainedConfig) -> dict[str, GGUFTensorRule]:
     """The gguf-name -> DeepSeek-native-name map for all non-routed-expert tensors.
 
@@ -293,8 +312,14 @@ def deepseek4_tensor_rules(hf_config: PretrainedConfig) -> dict[str, GGUFTensorR
         "token_embd.weight": raw("embed.weight"),
         # remap_weight_name_to_dpsk_hf_format only rewrites the exact name
         # "head.weight", which a ".qweight"-suffixed yield would miss — target
-        # the post-remap name directly.
-        "output.weight": quant("lm_head.weight"),
+        # the post-remap name directly. Under DSPARK the draft shares the
+        # target's lm_head module and multiplies lm_head.weight directly, so
+        # the head is built unquantized and its Q8_0 payload is dequantized.
+        "output.weight": (
+            GGUFTensorRule(target="lm_head.weight", mode="dequant_bf16")
+            if _gguf_lm_head_is_dense()
+            else quant("lm_head.weight")
+        ),
         "output_norm.weight": raw("norm.weight"),
         "output_hc_fn.weight": raw("hc_head_fn"),
         "output_hc_base.weight": raw("hc_head_base"),

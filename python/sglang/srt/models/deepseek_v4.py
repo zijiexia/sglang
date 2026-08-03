@@ -138,7 +138,13 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -2493,6 +2499,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.is_gguf_quant = _is_gguf_quant(quant_config)
+        # DSpark shares the target's lm_head module and multiplies
+        # lm_head.weight directly, so under GGUF the head is built dense
+        # (the GGUF weights iterator dequantizes output.weight to match).
+        self.gguf_dense_lm_head = self.is_gguf_quant and (
+            get_server_args().speculative_algorithm == "DSPARK"
+        )
         # Model-level resolution of the fp8 wo_a GEMM mode; per-layer attention
         # modules derive the same value unless constructed with an explicit
         # wo_a_fp8 override (models doing that carry their own load path).
@@ -2509,7 +2521,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
-                    quant_config=quant_config,
+                    quant_config=None if self.gguf_dense_lm_head else quant_config,
                     prefix=add_prefix("lm_head", prefix),
                     use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
