@@ -291,6 +291,11 @@ _BYTES_PER_DST_PAGE = (
 
 _BYTES_PER_DST_PAGE_PADDED = math.ceil(_BYTES_PER_DST_PAGE / 576) * 576  # 37440
 
+# topk widths with a template instantiation in BOTH FlashInfer SM120 entry
+# points (decode_dsv4: {128,512,1024}; prefill dsv4_single adds 2048). Other
+# widths are padded up in _flash_mla_flashinfer.
+_SPARSE_MLA_SUPPORTED_TOPK = (128, 512, 1024)
+
 
 @triton.jit
 def _page_split_kernel(
@@ -532,12 +537,29 @@ def _flash_mla_flashinfer(
         else extra_indices
     )
 
+    # Both FlashInfer entry points template on topk (decode: {128,512,1024},
+    # prefill: {128,512,1024,2048}); other widths (e.g. the DSpark draft's
+    # SWA 192) are padded to the next instantiation with -1 candidates. The
+    # kernels bound per-token work by topk_length, so the padding is never
+    # visited — but that requires topk_length to be present.
+    true_topk = idx.shape[-1]
+    if true_topk not in _SPARSE_MLA_SUPPORTED_TOPK:
+        pad_to = min(t for t in _SPARSE_MLA_SUPPORTED_TOPK if t > true_topk)
+        if topk_length is None:
+            topk_length = torch.full(
+                (idx.shape[0],), true_topk, dtype=torch.int32, device=dev
+            )
+        idx = torch.nn.functional.pad(idx, (0, pad_to - true_topk), value=-1)
+
     output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=dev)
     out_lse = torch.empty(B, H, dtype=torch.float32, device=dev)
 
     # Use split-K for decode-sized batches and paged attention otherwise.
     if B <= _FI_DECODE_MAX_TOKENS:
-        topk = idx.shape[-1]
+        # Splits sized to the real candidate count: chunks beyond each
+        # token's topk_length are never launched into useful work, so the
+        # padded tail needs no split slots.
+        topk = true_topk
         extra_topk = extra_idx.shape[-1] if extra_idx is not None else 0
         _BI = 64
         num_splits = (topk + _BI - 1) // _BI + (
