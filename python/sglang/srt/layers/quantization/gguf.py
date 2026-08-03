@@ -46,7 +46,6 @@ if _is_cuda:
         ggml_dequantize,
         ggml_moe_a8,
         ggml_moe_a8_vec,
-        ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
@@ -58,7 +57,6 @@ elif _is_musa:
         ggml_dequantize,
         ggml_moe_a8,
         ggml_moe_a8_vec,
-        ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
@@ -349,7 +347,12 @@ def fused_moe_gguf(
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
-        BLOCK_SIZE = ggml_moe_get_block_size(qweight_type)
+        # sgl_kernel's ggml_moe_get_block_size is a tensor-less torch-library
+        # op the dispatcher cannot route (no Tensor to pick a backend from).
+        # The value is a compile-time constant in gguf/moe.cuh: MOE_X_* = 4
+        # for every quant type on CUDA (8 on ROCm, which never takes this
+        # path — GGUF kernels are CUDA/MUSA only).
+        BLOCK_SIZE = 4
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, BLOCK_SIZE, E
