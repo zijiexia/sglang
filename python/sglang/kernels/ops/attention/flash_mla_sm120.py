@@ -399,6 +399,9 @@ def _split_kv_pages_to_64(
     restricts the copy to the sub-pages actually referenced. The source is a
     whole per-layer KV pool while a decode step reads only its top-k tokens,
     so copying the pool wholesale dominated the attention time.
+
+    Pass ``token_indices=None`` for any consumer whose reads are not exactly
+    the indexed tokens — only the SM120 decode fast path qualifies.
     """
     assert src_pbs % _PBS_DST == 0 and src_pbs >= _PBS_DST
     if src_pbs == _PBS_DST:
@@ -494,12 +497,21 @@ def _flash_mla_flashinfer(
     dev = q.device
 
     # --- Page-split: convert pbs=N kv_cache to pbs=64 view ---
-    # Only the sub-pages `indices` selects are copied; k_cache is the whole
-    # per-layer pool, of which one forward reads at most topk tokens.
+    # k_cache is the whole per-layer pool. The decode fast path below gathers
+    # strictly per index (decode_dsv4_kernel.cuh, plus slot 0 for invalid
+    # candidates), so there we split only the referenced sub-pages. The
+    # B > _FI_DECODE_MAX_TOKENS path goes to the general paged-attention
+    # kernel, whose access pattern is not index-exact — it needs the full
+    # split. Prefill barely benefits from the narrowed copy anyway (measured
+    # +1.3% TTFT on DGX Spark), while getting it wrong silently corrupts
+    # attention: a 6.2-point GSM8K drop was traced to exactly this.
+    is_decode_fast_path = B <= _FI_DECODE_MAX_TOKENS
     kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
     src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
     kv_64 = (
-        _split_kv_pages_to_64(kv_u8, src_pbs, token_indices=indices)
+        _split_kv_pages_to_64(
+            kv_u8, src_pbs, token_indices=indices if is_decode_fast_path else None
+        )
         if src_pbs != _PBS_DST
         else kv_u8
     )
