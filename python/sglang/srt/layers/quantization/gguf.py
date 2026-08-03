@@ -41,7 +41,7 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 
 if _is_cuda:
-    from sgl_kernel import moe_align_block_size, moe_sum
+    from sgl_kernel import moe_sum
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
@@ -52,7 +52,7 @@ if _is_cuda:
 
     from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
 elif _is_musa:
-    from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
+    from sgl_kernel import gelu_and_mul, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
@@ -353,6 +353,13 @@ def fused_moe_gguf(
         # for every quant type on CUDA (8 on ROCm, which never takes this
         # path — GGUF kernels are CUDA/MUSA only).
         BLOCK_SIZE = 4
+
+        # The allocating wrapper, not sgl_kernel's raw op (which takes the
+        # output buffers as arguments). Imported lazily: the moe_runner
+        # package imports quantization modules at import time.
+        from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+            moe_align_block_size,
+        )
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, BLOCK_SIZE, E
