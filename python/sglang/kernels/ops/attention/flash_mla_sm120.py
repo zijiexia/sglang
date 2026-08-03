@@ -556,10 +556,11 @@ def _flash_mla_flashinfer(
 
     # Use split-K for decode-sized batches and paged attention otherwise.
     if B <= _FI_DECODE_MAX_TOKENS:
-        # Splits sized to the real candidate count: chunks beyond each
-        # token's topk_length are never launched into useful work, so the
-        # padded tail needs no split slots.
-        topk = true_topk
+        # Split count follows the (possibly padded) index width — FlashInfer
+        # validates mid_out against it, and the decode kernel already handles
+        # splits whose chunks lie beyond a token's topk_length (every short
+        # sequence exercises that path).
+        topk = idx.shape[-1]
         extra_topk = extra_idx.shape[-1] if extra_idx is not None else 0
         _BI = 64
         num_splits = (topk + _BI - 1) // _BI + (
