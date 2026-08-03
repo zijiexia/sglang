@@ -204,6 +204,94 @@ def fused_mul_mat_gguf(
     return y
 
 
+# Above this many tokens the routed MoE switches from the per-route vector
+# kernel to tile-dequant + GEMM. The vector kernel re-reads an expert's packed
+# weights once per (token, expert) route (~7MB for DeepSeek-V4-Flash), so its
+# traffic grows as routes x expert-bytes, while dequant+GEMM pays a fixed
+# ~2x bf16 expert-bytes per layer. For topk=6 / 256 experts the break-even is
+# ~650 tokens; 512 leaves margin for the GEMM's better bandwidth efficiency.
+# Decode (graph-captured, small batch) always stays on the vector kernel.
+_DEQUANT_GEMM_MIN_TOKENS = 512
+
+# Experts dequantized per scratch tile: bounds transient bf16 scratch to
+# tile * (w13 + w2) bytes (~800MB for DeepSeek-V4-Flash at 16).
+_DEQUANT_GEMM_EXPERT_TILE = 16
+
+
+def _moe_dequant_gemm(
+    *,
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    qweight_type: int,
+    qweight_type2: int,
+    act,
+    out: torch.Tensor,
+) -> None:
+    """Routed MoE as per-expert-tile dequantize + bf16 GEMMs.
+
+    Prefill-only path: it host-syncs the per-expert route counts and launches
+    data-dependent GEMMs, neither of which is CUDA-graph capturable. Not
+    reached at decode (see _DEQUANT_GEMM_MIN_TOKENS).
+    """
+    num_tokens, hidden = x.shape
+    E = w1.shape[0]
+    topk = topk_ids.shape[1]
+    device = x.device
+
+    flat_expert = topk_ids.reshape(-1).to(torch.int64)
+    flat_token = torch.arange(
+        num_tokens, device=device, dtype=torch.int64
+    ).repeat_interleave(topk)
+    order = torch.argsort(flat_expert)
+    sorted_expert_counts = torch.bincount(flat_expert, minlength=E)
+    sorted_token = flat_token[order]
+    gathered = x[sorted_token]
+    route_weight = topk_weights.reshape(-1, 1)[order].to(x.dtype)
+    out_routes = torch.empty_like(gathered)
+
+    # Host sync: fine on prefill (not captured), needed for GEMM extents.
+    counts = sorted_expert_counts.tolist()
+
+    def _dequant_tile(packed: torch.Tensor, qtype: int) -> torch.Tensor:
+        tile, rows, packed_bytes = packed.shape
+        block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
+        cols = packed_bytes // type_size * block_size
+        dequant = ggml_dequantize(
+            packed.reshape(tile * rows, packed_bytes).contiguous(),
+            qtype,
+            tile * rows,
+            cols,
+            x.dtype,
+        )
+        return dequant.view(tile, rows, cols)
+
+    start = 0
+    for tile_begin in range(0, E, _DEQUANT_GEMM_EXPERT_TILE):
+        tile_end = min(tile_begin + _DEQUANT_GEMM_EXPERT_TILE, E)
+        tile_counts = counts[tile_begin:tile_end]
+        tile_routes = sum(tile_counts)
+        if tile_routes == 0:
+            continue
+        w13_tile = _dequant_tile(w1[tile_begin:tile_end], qweight_type)
+        w2_tile = _dequant_tile(w2[tile_begin:tile_end], qweight_type2)
+        seg_start = start
+        for i, m in enumerate(tile_counts):
+            if m == 0:
+                continue
+            seg = gathered[seg_start : seg_start + m]
+            h = act(seg @ w13_tile[i].T)
+            out_routes[seg_start : seg_start + m] = h @ w2_tile[i].T
+            seg_start += m
+        start = seg_start
+
+    out_routes.mul_(route_weight)
+    out.zero_()
+    out.index_add_(0, sorted_token, out_routes)
+
+
 def fused_moe_gguf(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -235,6 +323,23 @@ def fused_moe_gguf(
         raise ValueError(f"Unsupported activation: {activation}")
 
     out_hidden_states = torch.empty_like(x)
+    if (
+        x.shape[0] >= _DEQUANT_GEMM_MIN_TOKENS
+        and qweight_type in DEQUANT_TYPES
+        and qweight_type2 in DEQUANT_TYPES
+    ):
+        _moe_dequant_gemm(
+            x=x,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            qweight_type=qweight_type,
+            qweight_type2=qweight_type2,
+            act=act,
+            out=out_hidden_states,
+        )
+        return out_hidden_states
     # unless we decent expert reuse we are better off running moe_vec kernel
     if (
         qweight_type2 in MMQ_QUANT_TYPES
