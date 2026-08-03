@@ -498,13 +498,14 @@ def _flash_mla_flashinfer(
 
     # --- Page-split: convert pbs=N kv_cache to pbs=64 view ---
     # k_cache is the whole per-layer pool. The decode fast path below gathers
-    # strictly per index (decode_dsv4_kernel.cuh, plus slot 0 for invalid
-    # candidates), so there we split only the referenced sub-pages. The
-    # B > _FI_DECODE_MAX_TOKENS path goes to the general paged-attention
-    # kernel, whose access pattern is not index-exact — it needs the full
-    # split. Prefill barely benefits from the narrowed copy anyway (measured
-    # +1.3% TTFT on DGX Spark), while getting it wrong silently corrupts
-    # attention: a 6.2-point GSM8K drop was traced to exactly this.
+    # strictly per index — decode_dsv4_kernel.cuh reads only idx // 64, plus
+    # slot 0 which it substitutes for invalid candidates — so there we split
+    # only the referenced sub-pages. Above _FI_DECODE_MAX_TOKENS the general
+    # paged-attention kernel takes over; its access pattern has not been
+    # audited, so it keeps the full split. Prefill measures +1.3% TTFT from
+    # the narrowed copy (it is MoE-vec bound), so confining the optimization
+    # to the verified path costs effectively nothing, while a sub-page the
+    # consumer reads but the mask skipped would corrupt attention silently.
     is_decode_fast_path = B <= _FI_DECODE_MAX_TOKENS
     kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
     src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
