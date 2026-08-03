@@ -182,6 +182,8 @@ def build_config_from_gguf(gguf_path: str) -> PretrainedConfig:
         **base,
         num_hidden_layers=layer_count,
         n_routed_experts=expert_count,
+        # DSpark stage attention asserts compress_ratio == 0 on every stage.
+        compress_ratios=[0] * layer_count,
         # DSpark bundling markers: checkpoint_bundles_dspark_draft keys on
         # these, remapping the draft arch to DeepseekV4ForCausalLMDSpark.
         dspark_block_size=int(_read_field(reader, _KV_PREFIX + "block_size")),
