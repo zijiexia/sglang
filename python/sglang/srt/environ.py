@@ -317,11 +317,7 @@ class Envs:
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
-    # DIAGNOSTIC DEFAULT (revert before merge): externally-set env does not
-    # reach the scheduler process in this deployment (inherited env is
-    # scrubbed at spawn; verified via /proc/<scheduler>/environ), so the
-    # DSpark cycle-decomposition campaign flips the default on temporarily.
-    SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(("all",))
+    SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
     SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_STS_COLLECT_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH = EnvStr("")

@@ -1,11 +1,13 @@
 """GGUF linear dequant+GEMM routing tests.
 
-fused_mul_mat_gguf routes prefill-sized batches to dequant + bf16 GEMM via
+fused_mul_mat_gguf routes large-M batches to dequant + bf16 GEMM via
 _use_linear_dequant_gemm, which gates on the measured (backend, quant type)
-allowlist, the M threshold, CUDA-graph capture, and a dense-scratch cap.
-These tests pin every gate at its boundary plus numerical agreement of the
-GEMM route against explicit dequantize + matmul, and the MMQ route against
-the same reference at MMQ tolerance (its activations are Q8_1-quantized).
+allowlist, a per-device-capability M threshold
+(_resolve_linear_dequant_gemm_min_tokens: SM121 = 60, general CUDA = 512),
+and a dense-scratch cap. Graph safety is by construction (the predicate is
+a pure function of static per-graph values), pinned here by a capture-and-
+replay test at the DSpark verify width. Numerical agreement is checked for
+both routes against explicit dequantize + matmul.
 """
 
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -22,7 +24,9 @@ from gguf.quants import quantize
 from sglang.srt.layers.quantization import gguf as gguf_quant
 from sglang.test.test_utils import CustomTestCase
 
-_MIN = gguf_quant._LINEAR_DEQUANT_GEMM_MIN_TOKENS
+# The device's active threshold (60 on SM121, 512 elsewhere): boundary tests
+# must hold on every CUDA CI runner, so they key off the resolved value.
+_MIN = gguf_quant._linear_dequant_gemm_min_tokens()
 
 
 def _q8_0_qweight(
@@ -41,8 +45,29 @@ def _q8_0_qweight(
     )
 
 
+class TestThresholdPolicy(CustomTestCase):
+    """The pure per-capability policy, independent of the host device."""
+
+    def test_sm121_uses_measured_low_m_threshold(self):
+        self.assertEqual(
+            gguf_quant._resolve_linear_dequant_gemm_min_tokens((12, 1)),
+            gguf_quant._LINEAR_DEQUANT_GEMM_MIN_TOKENS_SM121,
+        )
+
+    def test_other_capabilities_keep_general_policy(self):
+        for cap in [(8, 0), (9, 0), (10, 0), (12, 0)]:
+            self.assertEqual(
+                gguf_quant._resolve_linear_dequant_gemm_min_tokens(cap),
+                gguf_quant._LINEAR_DEQUANT_GEMM_MIN_TOKENS,
+            )
+
+    def test_general_policy_is_prefill_scale(self):
+        self.assertEqual(gguf_quant._LINEAR_DEQUANT_GEMM_MIN_TOKENS, 512)
+        self.assertEqual(gguf_quant._LINEAR_DEQUANT_GEMM_MIN_TOKENS_SM121, 60)
+
+
 class TestLinearDequantGemmPredicate(CustomTestCase):
-    """Pure predicate gates (no kernels launched except the capture probe)."""
+    """Predicate gates at the device's resolved threshold."""
 
     def _x(self, m: int) -> torch.Tensor:
         return torch.zeros(m, 64, dtype=torch.bfloat16, device="cuda")
@@ -69,8 +94,7 @@ class TestLinearDequantGemmPredicate(CustomTestCase):
 
     def test_scratch_cap_excludes_lm_head_sized_weights(self):
         # DS4-Flash lm_head is 129280x4096 -> 1.06GB bf16, over the 256MB cap.
-        # Build a fake packed tensor with that logical shape (no data needed
-        # for the predicate; it only reads .shape).
+        # The predicate only reads .shape, so meta tensors suffice.
         import gguf as gguf_pkg
 
         block_size, type_size = gguf_pkg.GGML_QUANT_SIZES[self.q8_0]
@@ -92,7 +116,6 @@ class TestLinearDequantGemmPredicate(CustomTestCase):
     def test_predicate_is_static_per_shape(self):
         # Graph safety is by construction: the predicate depends only on
         # static per-graph values, so capture and replay cannot diverge.
-        # Same inputs -> same answer, repeatedly.
         x = self._x(_MIN)
         first = gguf_quant._use_linear_dequant_gemm(x, self.qweight, self.q8_0)
         self.assertTrue(first)
@@ -145,19 +168,16 @@ class TestLinearDequantGemmNumerics(CustomTestCase):
         self.assertGreater(cos.item(), 0.99)
 
     def test_graph_capture_replay(self):
-        # The DSpark target-verify graph captures this route at M=72. Pin:
-        # (1) the route is numerically correct when captured and replayed,
-        # (2) replays are self-consistent (stable scratch addresses), and
-        # (3) capture does not leak one scratch per call — the dequant
-        # scratch is freed before the next allocation inside the capture.
+        # The DSpark target-verify graph captures this route at M=72 on
+        # SM121. Pin: (1) the route is numerically correct when captured
+        # and replayed, and (2) replays are self-consistent. Skipped where
+        # the device threshold keeps M=72 on MMQ (general CUDA policy).
         m = 72
         x_static = (
             torch.randn(m, self.COLS, dtype=torch.float32, device="cuda") * 0.1
         ).to(torch.bfloat16)
-        self.assertTrue(
-            gguf_quant._use_linear_dequant_gemm(x_static, self.qweight, self.q8_0)
-        )
-        # Warmup on a side stream (allocator state), as CUDA graphs require.
+        if not gguf_quant._use_linear_dequant_gemm(x_static, self.qweight, self.q8_0):
+            self.skipTest("device threshold keeps M=72 on MMQ (non-SM121)")
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):

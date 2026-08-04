@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import warnings
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import gguf
@@ -167,14 +168,33 @@ MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
 # Above this many tokens a quantized linear switches from the MMQ kernel to
-# dequant + bf16 GEMM (see _use_linear_dequant_gemm). Measured break-even
-# points on GB10 for Q8_0 (the allowlisted type): at M=12 MMQ wins (66ms vs
-# ~100ms dequant floor per DS4-Flash decode step); at M=72 (DSpark verify
-# width) MMQ runs 15x off the bandwidth floor (288ms of a 992ms verify step)
-# and at M>=2048 (prefill) 20-40x off. 48 splits the measured regimes:
-# plain decode widths (<=32) keep MMQ, spec-verify/draft widths (60/72) and
-# prefill chunks flip to the GEMM route.
-_LINEAR_DEQUANT_GEMM_MIN_TOKENS = 48
+# dequant + bf16 GEMM (see _use_linear_dequant_gemm). The general CUDA
+# policy stays at prefill scale: the only broad evidence is that the MMQ
+# kernel loses badly at prefill M (measured 20-40x off tensor-core GEMM
+# rates at M>=2048 on GB10).
+_LINEAR_DEQUANT_GEMM_MIN_TOKENS = 512
+
+# On GB10 (SM121, the measured domain) the crossover was measured much
+# lower: at M=12 MMQ wins (66ms vs ~100ms dequant floor per DS4-Flash
+# decode step); at M=72 (DSpark verify width) MMQ runs 15x off the
+# bandwidth floor (288ms of a 992ms verify step); the smallest evidenced
+# width that benefits is the M=60 drafter path. Only exact SM121 uses
+# this threshold; other architectures keep the general policy until they
+# get their own measurements.
+_LINEAR_DEQUANT_GEMM_MIN_TOKENS_SM121 = 60
+
+
+def _resolve_linear_dequant_gemm_min_tokens(capability: tuple[int, int]) -> int:
+    """Pure policy: measured-domain threshold per device capability."""
+    if capability == (12, 1):
+        return _LINEAR_DEQUANT_GEMM_MIN_TOKENS_SM121
+    return _LINEAR_DEQUANT_GEMM_MIN_TOKENS
+
+
+@lru_cache(maxsize=1)
+def _linear_dequant_gemm_min_tokens() -> int:
+    return _resolve_linear_dequant_gemm_min_tokens(torch.cuda.get_device_capability())
+
 
 # Ceiling on the transient dense-weight scratch the dequant+GEMM linear route
 # may allocate. Covers every DeepSeek-V4-Flash prefill linear (largest is
@@ -196,24 +216,23 @@ def _use_linear_dequant_gemm(
 ) -> bool:
     """Whether a quantized linear should take the dequant + bf16 GEMM route.
 
-    Three gates (BS-1 review hardening, round-2 revision):
+    Three gates (BS-1 review hardening, round-2/3 revisions):
     - measured (backend, type) allowlist,
-    - M at or above the measured MMQ/GEMM crossover,
+    - M at or above the device's measured MMQ/GEMM crossover
+      (_resolve_linear_dequant_gemm_min_tokens: SM121 = 60, general = 512),
     - bounded dense-weight scratch (excludes lm_head-sized weights).
 
     CUDA-graph safety is by construction rather than by an
     is_current_stream_capturing() bail-out: the predicate is a pure function
-    of static per-graph values (quant type, M = x.shape[0], weight shape),
-    so capture and replay always take the same branch, and the route's ops
-    (ggml_dequantize + mm, fixed shapes, no host sync) are capturable. The
-    dequant scratch captured inside a graph is freed before the next layer's
-    allocation, so the caching allocator reuses one scratch block per graph
-    (pinned by test_graph_capture_replay). DSpark target-verify graphs
-    (M=72) are the intended in-graph consumer.
+    of static per-graph values (quant type, M = x.shape[0], weight shape,
+    device capability), so capture and replay always take the same branch,
+    and the route's ops (ggml_dequantize + mm, fixed shapes, no host sync)
+    are capturable — pinned by test_graph_capture_replay at the DSpark
+    verify width (M=72), the intended in-graph consumer.
     """
     if qweight_type not in _LINEAR_DEQUANT_GEMM_TYPES:
         return False
-    if x.shape[0] < _LINEAR_DEQUANT_GEMM_MIN_TOKENS:
+    if x.shape[0] < _linear_dequant_gemm_min_tokens():
         return False
     block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
     n_elements = qweight.shape[0] * (qweight.shape[1] // type_size * block_size)
