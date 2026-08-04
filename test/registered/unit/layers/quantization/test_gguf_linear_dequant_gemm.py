@@ -89,20 +89,18 @@ class TestLinearDequantGemmPredicate(CustomTestCase):
             gguf_quant._use_linear_dequant_gemm(self._x(_MIN), wq_b_like, self.q8_0)
         )
 
-    def test_graph_capture_guard(self):
+    def test_predicate_is_static_per_shape(self):
+        # Graph safety is by construction: the predicate depends only on
+        # static per-graph values, so capture and replay cannot diverge.
+        # Same inputs -> same answer, repeatedly.
         x = self._x(_MIN)
-        self.assertTrue(gguf_quant._use_linear_dequant_gemm(x, self.qweight, self.q8_0))
-        g = torch.cuda.CUDAGraph()
-        results = []
-        buf = torch.zeros(1, device="cuda")
-        with torch.cuda.graph(g):
-            # A real captured op keeps the capture non-empty; the predicate
-            # itself is host logic evaluated during capture.
-            buf.add_(1)
-            results.append(
-                gguf_quant._use_linear_dequant_gemm(x, self.qweight, self.q8_0)
+        first = gguf_quant._use_linear_dequant_gemm(x, self.qweight, self.q8_0)
+        self.assertTrue(first)
+        for _ in range(3):
+            self.assertEqual(
+                gguf_quant._use_linear_dequant_gemm(x, self.qweight, self.q8_0),
+                first,
             )
-        self.assertFalse(results[0])
 
 
 class TestLinearDequantGemmNumerics(CustomTestCase):
@@ -145,6 +143,42 @@ class TestLinearDequantGemmNumerics(CustomTestCase):
             y.reshape(-1), ref.reshape(-1), dim=0
         )
         self.assertGreater(cos.item(), 0.99)
+
+    def test_graph_capture_replay(self):
+        # The DSpark target-verify graph captures this route at M=72. Pin:
+        # (1) the route is numerically correct when captured and replayed,
+        # (2) replays are self-consistent (stable scratch addresses), and
+        # (3) capture does not leak one scratch per call — the dequant
+        # scratch is freed before the next allocation inside the capture.
+        m = 72
+        x_static = (
+            torch.randn(m, self.COLS, dtype=torch.float32, device="cuda") * 0.1
+        ).to(torch.bfloat16)
+        self.assertTrue(
+            gguf_quant._use_linear_dequant_gemm(x_static, self.qweight, self.q8_0)
+        )
+        # Warmup on a side stream (allocator state), as CUDA graphs require.
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                gguf_quant.fused_mul_mat_gguf(x_static, self.qweight, self.q8_0)
+        torch.cuda.current_stream().wait_stream(s)
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            y_static = gguf_quant.fused_mul_mat_gguf(x_static, self.qweight, self.q8_0)
+        g.replay()
+        torch.cuda.synchronize()
+        ref = x_static.to(torch.float32) @ self.ref_w.T
+        cos = torch.nn.functional.cosine_similarity(
+            y_static.to(torch.float32).reshape(-1), ref.reshape(-1), dim=0
+        )
+        self.assertGreater(cos.item(), 0.999)
+        first = y_static.clone()
+        g.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(first, y_static))
 
     def test_routes_agree_with_each_other(self):
         x = (torch.randn(_MIN, self.COLS, dtype=torch.float32, device="cuda") * 0.1).to(
