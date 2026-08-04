@@ -2277,11 +2277,17 @@ def _gguf_quantization(view: Any) -> dict:
         overrides["quantization"] = "gguf"
     # The generic draft-quantization inheritance (speculative_draft_model_
     # quantization = quantization when unset) runs before this pass, so a
-    # GGUF draft checkpoint must derive its quantization here.
+    # GGUF draft checkpoint must derive its quantization here. The same
+    # applies to the speculative MoE runner backend: a non-GGUF target may
+    # have resolved a TopK-bypassing backend (e.g. flashinfer_mxfp4 on
+    # SM120) which _speculative_moe_runner_default copies to the draft, but
+    # GGUFMoEMethod.apply requires StandardTopKOutput — pin the draft back
+    # to the standard-TopK "auto" path.
     if view.speculative_draft_model_path is not None and check_gguf_file(
         view.speculative_draft_model_path
     ):
         overrides["speculative_draft_model_quantization"] = "gguf"
+        overrides["speculative_moe_runner_backend"] = "auto"
     return overrides
 
 

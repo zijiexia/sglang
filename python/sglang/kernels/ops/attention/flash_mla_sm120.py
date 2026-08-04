@@ -291,10 +291,12 @@ _BYTES_PER_DST_PAGE = (
 
 _BYTES_PER_DST_PAGE_PADDED = math.ceil(_BYTES_PER_DST_PAGE / 576) * 576  # 37440
 
-# topk widths with a template instantiation in BOTH FlashInfer SM120 entry
-# points (decode_dsv4: {128,512,1024}; prefill dsv4_single adds 2048). Other
-# widths are padded up in _flash_mla_flashinfer.
-_SPARSE_MLA_SUPPORTED_TOPK = (128, 512, 1024)
+# topk widths with a template instantiation per FlashInfer SM120 entry
+# point: the decode_dsv4 dispatch instantiates {128,512,1024}; the prefill
+# dsv4_single dispatch adds 2048. Other widths are padded up to the entry
+# point's next instantiation in _flash_mla_flashinfer.
+_SPARSE_MLA_DECODE_TOPK = (128, 512, 1024)
+_SPARSE_MLA_PREFILL_TOPK = (128, 512, 1024, 2048)
 
 
 @triton.jit
@@ -537,14 +539,26 @@ def _flash_mla_flashinfer(
         else extra_indices
     )
 
-    # Both FlashInfer entry points template on topk (decode: {128,512,1024},
-    # prefill: {128,512,1024,2048}); other widths (e.g. the DSpark draft's
-    # SWA 192) are padded to the next instantiation with -1 candidates. The
-    # kernels bound per-token work by topk_length, so the padding is never
-    # visited — but that requires topk_length to be present.
+    # Each FlashInfer entry point templates on topk (decode: {128,512,1024};
+    # prefill additionally instantiates 2048); other widths (e.g. the DSpark
+    # draft's SWA 192) are padded to the entry point's next instantiation
+    # with -1 candidates. The kernels bound per-token work by topk_length,
+    # so the padding is never visited — but that requires topk_length to be
+    # present.
+    supported_topk = (
+        _SPARSE_MLA_DECODE_TOPK
+        if B <= _FI_DECODE_MAX_TOKENS
+        else _SPARSE_MLA_PREFILL_TOPK
+    )
     true_topk = idx.shape[-1]
-    if true_topk not in _SPARSE_MLA_SUPPORTED_TOPK:
-        pad_to = min(t for t in _SPARSE_MLA_SUPPORTED_TOPK if t > true_topk)
+    if true_topk not in supported_topk:
+        larger = [t for t in supported_topk if t > true_topk]
+        if not larger:
+            raise ValueError(
+                f"sparse-MLA SM120 has no instantiation for topk={true_topk} "
+                f"(entry point supports {supported_topk})."
+            )
+        pad_to = larger[0]
         if topk_length is None:
             topk_length = torch.full(
                 (idx.shape[0],), true_topk, dtype=torch.int32, device=dev

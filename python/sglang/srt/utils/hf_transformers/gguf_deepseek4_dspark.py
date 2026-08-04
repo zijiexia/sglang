@@ -279,11 +279,27 @@ def dspark_gguf_weights_iterator(
     reader = gguf.GGUFReader(gguf_file)
 
     unquantized_type_names = {"F32", "F16", "BF16", "I32"}
+    moe_exps_types: dict[int, dict[str, object]] = {}
     for tensor in reader.tensors:
-        if tensor.name not in rules and _MOE_EXPS_RE.fullmatch(tensor.name) is None:
+        moe_match = _MOE_EXPS_RE.fullmatch(tensor.name)
+        if moe_match is not None:
+            moe_exps_types.setdefault(int(moe_match.group(1)), {})[
+                moe_match.group(2)
+            ] = tensor.tensor_type
+        elif tensor.name not in rules:
             raise ValueError(
                 f"Unexpected tensor {tensor.name!r} in deepseek4-dspark GGUF; "
                 "update dspark_tensor_rules()."
+            )
+    for stage_id, types in moe_exps_types.items():
+        # FusedMoE fuses gate+up under a single w13 quant type (mirrors the
+        # target iterator's check): mixed types would both be written to the
+        # one w13_qweight_type marker and dequantize each other's format.
+        if "gate" in types and "up" in types and types["gate"] != types["up"]:
+            raise ValueError(
+                f"dspark.{stage_id}: ffn_gate_exps is {types['gate'].name} "
+                f"but ffn_up_exps is {types['up'].name}; the fused w13 GGUF "
+                "MoE weight requires one quantization type for both."
             )
     present = {t.name for t in reader.tensors}
     missing = sorted(set(rules) - present)
