@@ -1613,6 +1613,12 @@ class FusedMoE(torch.nn.Module):
                             param.materialize(stacked.shape, dtype=stacked.dtype)
                             param.data.copy_(stacked)
 
+                    # Release the host-side staging copies eagerly: on large
+                    # MoE models keeping every expert shard alive after
+                    # materialization doubles the peak host memory of a load.
+                    param.data_container.clear()
+                    param.expert_data_map.clear()
+
 
 @register_custom_op(out_shape="hidden_states")
 def moe_forward_piecewise_cuda_graph_impl(

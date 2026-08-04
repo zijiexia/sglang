@@ -2133,6 +2133,8 @@ class ServerArgs:
         Arg(
             help="The quantization method for speculative model.",
             choices=QUANTIZATION_CHOICES,
+            # Resolved by _gguf_quantization when the draft checkpoint is GGUF.
+            resolvable=True,
         ),
         NS("spec"),
     ] = None

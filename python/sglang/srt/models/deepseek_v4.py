@@ -138,7 +138,13 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -203,6 +209,13 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
     ("gate_up_proj", "up_proj", 1),
 ]
+
+
+def _is_gguf_quant(quant_config: Optional[QuantizationConfig]) -> bool:
+    # GGUF checkpoints ship separate wq_a/wkv packed-quant tensors and a
+    # non-fp8 wo_a, so the wqkv_a fusion and the fp8 wo_a GEMM env opt-ins
+    # cannot apply to them.
+    return quant_config is not None and quant_config.get_name() == "gguf"
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
@@ -436,10 +449,13 @@ class MqaAttentionBase(nn.Module):
         assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
 
+        is_gguf = _is_gguf_quant(quant_config)
         fuse: bool = (
-            envs.SGLANG_OPT_FUSE_WQA_WKV.get() if fuse_wqa_wkv is None else fuse_wqa_wkv
+            (envs.SGLANG_OPT_FUSE_WQA_WKV.get() and not is_gguf)
+            if fuse_wqa_wkv is None
+            else fuse_wqa_wkv
         )
-        fp8: bool = _FP8_WO_A_GEMM if wo_a_fp8 is None else wo_a_fp8
+        fp8: bool = (_FP8_WO_A_GEMM and not is_gguf) if wo_a_fp8 is None else wo_a_fp8
         reduce_results: bool = (
             (self.attn_tp_size == get_parallel().tp_size and self.attn_tp_size > 1)
             if wo_b_reduce_results is None
@@ -455,6 +471,7 @@ class MqaAttentionBase(nn.Module):
             wo_a_quant_config = None
 
         self.fuse_wqa_wkv = fuse
+        self.wo_a_fp8 = fp8
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self._attn_sink_local: Optional[torch.Tensor] = None
@@ -1309,7 +1326,7 @@ class MQALayer(MqaAttentionBase):
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
-        if _FP8_WO_A_GEMM:
+        if self.wo_a_fp8:
             import deep_gemm
 
             from sglang.srt.layers import deep_gemm_wrapper
@@ -2481,6 +2498,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
+        self.is_gguf_quant = _is_gguf_quant(quant_config)
+        # DSpark shares the target's lm_head module and multiplies
+        # lm_head.weight directly, so under GGUF the head is built dense
+        # (the GGUF weights iterator dequantizes output.weight to match).
+        self.gguf_dense_lm_head = self.is_gguf_quant and (
+            get_server_args().speculative_algorithm == "DSPARK"
+        )
+        # Model-level resolution of the fp8 wo_a GEMM mode; per-layer attention
+        # modules derive the same value unless constructed with an explicit
+        # wo_a_fp8 override (models doing that carry their own load path).
+        self.wo_a_fp8 = _FP8_WO_A_GEMM and not self.is_gguf_quant
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -2493,7 +2521,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
-                    quant_config=quant_config,
+                    quant_config=None if self.gguf_dense_lm_head else quant_config,
                     prefix=add_prefix("lm_head", prefix),
                     use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
@@ -2661,7 +2689,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
-        if _FP8_WO_A_GEMM:
+        if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
 
         if is_nextn:
@@ -2816,7 +2844,12 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+        is_gguf = self.is_gguf_quant
+
+        # The streaming dequant turns fp8-formatted checkpoint wo_a into bf16
+        # when the fp8 GEMM mode is off; GGUF checkpoints never carry
+        # fp8-formatted wo_a, so skip the (inert but buffering) wrapper.
+        if not self.wo_a_fp8 and not is_gguf:
             weights = _dequant_fp8_wo_a_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
@@ -2836,7 +2869,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
-        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get() and not is_gguf
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
 
         def auto_weight_loader(module):
@@ -2866,7 +2899,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             weight_names = []
             for name, loaded_weight in weights:
                 if (
-                    _FP8_WO_A_GEMM
+                    self.wo_a_fp8
                     and name.endswith(".wo_a.weight")
                     and loaded_weight.dtype != torch.float8_e4m3fn
                 ):
@@ -2878,7 +2911,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                         "SGLANG_OPT_FP8_WO_A_GEMM=0."
                     )
                 try:
-                    use_async_loading = should_async_load(loaded_weight)
+                    # GGUF staging (data_container/expert_data_map appends,
+                    # merged-shard bookkeeping) is not thread-safe; load inline.
+                    use_async_loading = should_async_load(loaded_weight) and not is_gguf
 
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,
@@ -3148,6 +3183,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             self._prewarm_mhc_pre_kernels()
 
     def get_embed_and_head(self):
+        if self.is_gguf_quant:
+            # The GGUF lm_head stores packed qweight bytes; speculative
+            # decoding workers need a dense lm_head.weight to share with the
+            # draft model.
+            raise NotImplementedError(
+                "Speculative decoding is not supported for GGUF-quantized "
+                "DeepSeek-V4 checkpoints."
+            )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):

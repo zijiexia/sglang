@@ -299,6 +299,10 @@ def _block_quant_stack_applies(*, wkv_linears: list[torch.nn.Module]) -> bool:
 
 def _dequant_supported(linear: torch.nn.Module) -> bool:
     """Mirrors the preconditions asserted in _dequant_linear_weight."""
+    if not hasattr(linear, "weight"):
+        # Packed schemes (GGUF) register qweight instead of a dense weight;
+        # the caller falls back to the per-linear torch path.
+        return False
     weight = linear.weight
     if weight.dtype in (torch.bfloat16, torch.float16, torch.float32):
         return True

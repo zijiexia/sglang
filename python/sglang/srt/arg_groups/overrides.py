@@ -1595,8 +1595,17 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
 @register_post_process
 def _deepseek_v4_sm120_moe(view: Any) -> dict:
     """Default DeepSeek V4 MXFP4 experts to FlashInfer CUTLASS on SM120."""
+    from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+
     hf_config = view.get_model_config().hf_config
     if hf_config.architectures[0] != "DeepseekV4ForCausalLM":
+        return {}
+    if view.quantization == "gguf" or (
+        view.load_format in ("auto", "gguf") and check_gguf_file(view.model_path)
+    ):
+        # GGUF experts run through GGUFMoEMethod's own kernels; the
+        # flashinfer_mxfp4 runner would make TopK emit BypassedTopKOutput,
+        # which that method cannot consume.
         return {}
     if is_sm120_supported() and view.moe_runner_backend == "auto":
         logger.info(
@@ -2261,11 +2270,25 @@ def _speculative_moe_runner_default(view: Any) -> dict:
 def _gguf_quantization(view: Any) -> dict:
     from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 
-    if (view.load_format == "auto" or view.load_format == "gguf") and check_gguf_file(
-        view.model_path
+    if view.load_format != "auto" and view.load_format != "gguf":
+        return {}
+    overrides = {}
+    if check_gguf_file(view.model_path):
+        overrides["quantization"] = "gguf"
+    # The generic draft-quantization inheritance (speculative_draft_model_
+    # quantization = quantization when unset) runs before this pass, so a
+    # GGUF draft checkpoint must derive its quantization here. The same
+    # applies to the speculative MoE runner backend: a non-GGUF target may
+    # have resolved a TopK-bypassing backend (e.g. flashinfer_mxfp4 on
+    # SM120) which _speculative_moe_runner_default copies to the draft, but
+    # GGUFMoEMethod.apply requires StandardTopKOutput — pin the draft back
+    # to the standard-TopK "auto" path.
+    if view.speculative_draft_model_path is not None and check_gguf_file(
+        view.speculative_draft_model_path
     ):
-        return {"quantization": "gguf"}
-    return {}
+        overrides["speculative_draft_model_quantization"] = "gguf"
+        overrides["speculative_moe_runner_backend"] = "auto"
+    return overrides
 
 
 @register_post_process

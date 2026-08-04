@@ -3051,21 +3051,33 @@ class GGUFModelLoader(BaseModelLoader):
     ) -> nn.Module:
 
         local_model_path = self._prepare_weights(model_config.model_path)
-        gguf_weights_map = self._get_gguf_weights_map(model_config)
-        # we can only know if tie word embeddings after mapping weights
-        if "lm_head.weight" in get_gguf_extra_tensor_names(
-            local_model_path, gguf_weights_map
-        ):
-            model_config.hf_config.update({"tie_word_embeddings": True})
+        from sglang.srt.utils.hf_transformers.gguf_arch import get_gguf_arch_adapter
+
+        gguf_arch_adapter = get_gguf_arch_adapter(local_model_path)
+        if gguf_arch_adapter is not None:
+            # Architectures the PyPI gguf package's name map doesn't know use
+            # the adapter's vendored mapping (the adapter's config builder is
+            # responsible for tie_word_embeddings).
+            weights_iterator = gguf_arch_adapter.weights_iterator(
+                local_model_path, model_config.hf_config
+            )
+        else:
+            gguf_weights_map = self._get_gguf_weights_map(model_config)
+            # we can only know if tie word embeddings after mapping weights
+            if "lm_head.weight" in get_gguf_extra_tensor_names(
+                local_model_path, gguf_weights_map
+            ):
+                model_config.hf_config.update({"tie_word_embeddings": True})
+            weights_iterator = self._get_weights_iterator(
+                local_model_path, gguf_weights_map
+            )
 
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
-            model.load_weights(
-                self._get_weights_iterator(local_model_path, gguf_weights_map)
-            )
+            model.load_weights(weights_iterator)
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)

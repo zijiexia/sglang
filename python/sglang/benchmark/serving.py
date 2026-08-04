@@ -977,7 +977,16 @@ def flush_server_cache(base_url: str, backend: str) -> None:
     cache_endpoint = (
         "/reset_prefix_cache" if backend.startswith("vllm") else "/flush_cache"
     )
-    response = requests.post(base_url + cache_endpoint, headers=get_auth_headers())
+    # The scheduler refuses to flush while it still counts running requests.
+    # The just-finished warmup request can linger there for a moment after
+    # its response is streamed (longer under speculative decoding), so retry
+    # briefly instead of failing the whole run.
+    deadline = time.monotonic() + 30
+    while True:
+        response = requests.post(base_url + cache_endpoint, headers=get_auth_headers())
+        if response.ok or time.monotonic() >= deadline:
+            break
+        time.sleep(1)
     response.raise_for_status()
 
 

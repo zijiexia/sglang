@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import warnings
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import gguf
@@ -41,24 +42,22 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 
 if _is_cuda:
-    from sgl_kernel import moe_align_block_size, moe_sum
+    from sgl_kernel import moe_sum
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
         ggml_moe_a8_vec,
-        ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
 
     from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
 elif _is_musa:
-    from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
+    from sgl_kernel import gelu_and_mul, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
         ggml_moe_a8_vec,
-        ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
@@ -168,6 +167,77 @@ DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
+# Above this many tokens a quantized linear switches from the MMQ kernel to
+# dequant + bf16 GEMM (see _use_linear_dequant_gemm). The general CUDA
+# policy stays at prefill scale: the only broad evidence is that the MMQ
+# kernel loses badly at prefill M (measured 20-40x off tensor-core GEMM
+# rates at M>=2048 on GB10).
+_LINEAR_DEQUANT_GEMM_MIN_TOKENS = 512
+
+# On GB10 (SM121, the measured domain) the crossover was measured much
+# lower: at M=12 MMQ wins (66ms vs ~100ms dequant floor per DS4-Flash
+# decode step); at M=72 (DSpark verify width) MMQ runs 15x off the
+# bandwidth floor (288ms of a 992ms verify step); the smallest evidenced
+# width that benefits is the M=60 drafter path. Only exact SM121 uses
+# this threshold; other architectures keep the general policy until they
+# get their own measurements.
+_LINEAR_DEQUANT_GEMM_MIN_TOKENS_SM121 = 60
+
+
+def _resolve_linear_dequant_gemm_min_tokens(capability: tuple[int, int]) -> int:
+    """Pure policy: measured-domain threshold per device capability."""
+    if capability == (12, 1):
+        return _LINEAR_DEQUANT_GEMM_MIN_TOKENS_SM121
+    return _LINEAR_DEQUANT_GEMM_MIN_TOKENS
+
+
+@lru_cache(maxsize=1)
+def _linear_dequant_gemm_min_tokens() -> int:
+    return _resolve_linear_dequant_gemm_min_tokens(torch.cuda.get_device_capability())
+
+
+# Ceiling on the transient dense-weight scratch the dequant+GEMM linear route
+# may allocate. Covers every DeepSeek-V4-Flash prefill linear (largest is
+# wq_b, 64MB bf16) while keeping vocabulary-sized weights on MMQ — e.g. a
+# prompt-logprob lm_head call (129280x4096 = 1.06GB bf16) must not allocate
+# a transient of that size.
+_LINEAR_DEQUANT_GEMM_MAX_SCRATCH_BYTES = 256 * 1024 * 1024
+
+# The dequant+GEMM linear route is enabled per (backend, quant type) only
+# where it has been benchmarked. CUDA GB10 evidence: Q8_0 MMQ runs at ~0.75
+# TFLOPS on M=2048 GEMMs (57.4% of DS4-Flash prefill GPU time) vs ~20-40x
+# faster as dequant + cuBLAS bf16 GEMM. Other types/backends keep MMQ until
+# they get their own measurements.
+_LINEAR_DEQUANT_GEMM_TYPES = frozenset({WeightType.Q8_0}) if _is_cuda else frozenset()
+
+
+def _use_linear_dequant_gemm(
+    x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
+) -> bool:
+    """Whether a quantized linear should take the dequant + bf16 GEMM route.
+
+    Three gates (BS-1 review hardening, round-2/3 revisions):
+    - measured (backend, type) allowlist,
+    - M at or above the device's measured MMQ/GEMM crossover
+      (_resolve_linear_dequant_gemm_min_tokens: SM121 = 60, general = 512),
+    - bounded dense-weight scratch (excludes lm_head-sized weights).
+
+    CUDA-graph safety is by construction rather than by an
+    is_current_stream_capturing() bail-out: the predicate is a pure function
+    of static per-graph values (quant type, M = x.shape[0], weight shape,
+    device capability), so capture and replay always take the same branch,
+    and the route's ops (ggml_dequantize + mm, fixed shapes, no host sync)
+    are capturable — pinned by test_graph_capture_replay at the DSpark
+    verify width (M=72), the intended in-graph consumer.
+    """
+    if qweight_type not in _LINEAR_DEQUANT_GEMM_TYPES:
+        return False
+    if x.shape[0] < _linear_dequant_gemm_min_tokens():
+        return False
+    block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+    n_elements = qweight.shape[0] * (qweight.shape[1] // type_size * block_size)
+    return n_elements * x.element_size() <= _LINEAR_DEQUANT_GEMM_MAX_SCRATCH_BYTES
+
 
 def fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
@@ -186,6 +256,15 @@ def fused_mul_mat_gguf(
     # enable MMVQ in contiguous batching with batch_size=1
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
+    # Prefill-sized batches on the measured allowlist: the MMQ kernel is a
+    # scalar-dp4a design that runs far below tensor-core GEMM rates at large
+    # M, while dequant traffic is a fixed ~2x weight-bytes. Dequantize and
+    # run a bf16 GEMM instead (gates in _use_linear_dequant_gemm).
+    elif _use_linear_dequant_gemm(x, qweight, qweight_type):
+        block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+        shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
+        weight = ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
+        y = x @ weight.T
     # Use MMQ Kernel if it's available (standard + k-quants)
     elif qweight_type in MMQ_QUANT_TYPES:
         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
@@ -204,6 +283,94 @@ def fused_mul_mat_gguf(
     return y
 
 
+# Above this many tokens the routed MoE switches from the per-route vector
+# kernel to tile-dequant + GEMM. The vector kernel re-reads an expert's packed
+# weights once per (token, expert) route (~7MB for DeepSeek-V4-Flash), so its
+# traffic grows as routes x expert-bytes, while dequant+GEMM pays a fixed
+# ~2x bf16 expert-bytes per layer. For topk=6 / 256 experts the break-even is
+# ~650 tokens; 512 leaves margin for the GEMM's better bandwidth efficiency.
+# Decode (graph-captured, small batch) always stays on the vector kernel.
+_DEQUANT_GEMM_MIN_TOKENS = 512
+
+# Experts dequantized per scratch tile: bounds transient bf16 scratch to
+# tile * (w13 + w2) bytes (~800MB for DeepSeek-V4-Flash at 16).
+_DEQUANT_GEMM_EXPERT_TILE = 16
+
+
+def _moe_dequant_gemm(
+    *,
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    qweight_type: int,
+    qweight_type2: int,
+    act,
+    out: torch.Tensor,
+) -> None:
+    """Routed MoE as per-expert-tile dequantize + bf16 GEMMs.
+
+    Prefill-only path: it host-syncs the per-expert route counts and launches
+    data-dependent GEMMs, neither of which is CUDA-graph capturable. Not
+    reached at decode (see _DEQUANT_GEMM_MIN_TOKENS).
+    """
+    num_tokens, hidden = x.shape
+    E = w1.shape[0]
+    topk = topk_ids.shape[1]
+    device = x.device
+
+    flat_expert = topk_ids.reshape(-1).to(torch.int64)
+    flat_token = torch.arange(
+        num_tokens, device=device, dtype=torch.int64
+    ).repeat_interleave(topk)
+    order = torch.argsort(flat_expert)
+    sorted_expert_counts = torch.bincount(flat_expert, minlength=E)
+    sorted_token = flat_token[order]
+    gathered = x[sorted_token]
+    route_weight = topk_weights.reshape(-1, 1)[order].to(x.dtype)
+    out_routes = torch.empty_like(gathered)
+
+    # Host sync: fine on prefill (not captured), needed for GEMM extents.
+    counts = sorted_expert_counts.tolist()
+
+    def _dequant_tile(packed: torch.Tensor, qtype: int) -> torch.Tensor:
+        tile, rows, packed_bytes = packed.shape
+        block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
+        cols = packed_bytes // type_size * block_size
+        dequant = ggml_dequantize(
+            packed.reshape(tile * rows, packed_bytes).contiguous(),
+            qtype,
+            tile * rows,
+            cols,
+            x.dtype,
+        )
+        return dequant.view(tile, rows, cols)
+
+    start = 0
+    for tile_begin in range(0, E, _DEQUANT_GEMM_EXPERT_TILE):
+        tile_end = min(tile_begin + _DEQUANT_GEMM_EXPERT_TILE, E)
+        tile_counts = counts[tile_begin:tile_end]
+        tile_routes = sum(tile_counts)
+        if tile_routes == 0:
+            continue
+        w13_tile = _dequant_tile(w1[tile_begin:tile_end], qweight_type)
+        w2_tile = _dequant_tile(w2[tile_begin:tile_end], qweight_type2)
+        seg_start = start
+        for i, m in enumerate(tile_counts):
+            if m == 0:
+                continue
+            seg = gathered[seg_start : seg_start + m]
+            h = act(seg @ w13_tile[i].T)
+            out_routes[seg_start : seg_start + m] = h @ w2_tile[i].T
+            seg_start += m
+        start = seg_start
+
+    out_routes.mul_(route_weight)
+    out.zero_()
+    out.index_add_(0, sorted_token, out_routes)
+
+
 def fused_moe_gguf(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -213,15 +380,45 @@ def fused_moe_gguf(
     qweight_type: int,
     qweight_type2: int,
     activation: str,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     def act(x: torch.Tensor):
         if activation == "silu":
+            if swiglu_limit is not None:
+                # Same clamped-SwiGLU kernel as the unquantized DeepSeek V4
+                # path (models/deepseek_v2.py), so numerics match.
+                from sglang.kernels.ops.activation.clamped_swiglu import (
+                    silu_and_mul_clamp,
+                )
+
+                out = torch.empty(
+                    (x.shape[0], x.shape[1] // 2), dtype=x.dtype, device=x.device
+                )
+                silu_and_mul_clamp(x, out, float(swiglu_limit))
+                return out
             return silu_and_mul(x)
         elif activation == "gelu":
             return gelu_and_mul(x)
         raise ValueError(f"Unsupported activation: {activation}")
 
     out_hidden_states = torch.empty_like(x)
+    if (
+        x.shape[0] >= _DEQUANT_GEMM_MIN_TOKENS
+        and qweight_type in DEQUANT_TYPES
+        and qweight_type2 in DEQUANT_TYPES
+    ):
+        _moe_dequant_gemm(
+            x=x,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            qweight_type=qweight_type,
+            qweight_type2=qweight_type2,
+            act=act,
+            out=out_hidden_states,
+        )
+        return out_hidden_states
     # unless we decent expert reuse we are better off running moe_vec kernel
     if (
         qweight_type2 in MMQ_QUANT_TYPES
@@ -231,7 +428,19 @@ def fused_moe_gguf(
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
-        BLOCK_SIZE = ggml_moe_get_block_size(qweight_type)
+        # sgl_kernel's ggml_moe_get_block_size is a tensor-less torch-library
+        # op the dispatcher cannot route (no Tensor to pick a backend from).
+        # The value is a compile-time constant in gguf/moe.cuh: MOE_X_* = 4
+        # for every quant type on CUDA (8 on ROCm, which never takes this
+        # path — GGUF kernels are CUDA/MUSA only).
+        BLOCK_SIZE = 4
+
+        # The allocating wrapper, not sgl_kernel's raw op (which takes the
+        # output buffers as arguments). Imported lazily: the moe_runner
+        # package imports quantization modules at import time.
+        from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+            moe_align_block_size,
+        )
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, BLOCK_SIZE, E
@@ -439,8 +648,10 @@ class GGUFLinearMethod(LinearMethodBase):
         shard_id = layer.qweight.shard_id
 
         if shard_id:
-            # dequantize shard weights respectively
-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+            # Dequantize shard weights respectively. Shards are recorded in
+            # checkpoint-file order; concatenate in canonical shard order
+            # (q/k/v, or the merged-linear output index) instead.
+            shard_id = ["q", "k", "v"] if "q" in shard_id else sorted(shard_id)
             qweight = layer.qweight
             result = []
             for idx in shard_id:
@@ -538,13 +749,38 @@ class GGUFMoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
 
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        if layer.moe_tp_size > 1:
+            # FusedMoE._load_gguf_weight narrows raw packed bytes along dim 0
+            # for every shard, which is wrong for w2 (its packed input dim is
+            # dim 1); fail loudly instead of producing corrupted experts.
+            raise ValueError(
+                "GGUF MoE weights do not support tensor parallelism yet; "
+                "run with tp 1 (or EP so that experts are not TP-sharded)."
+            )
+        # Stack the per-expert shards collected by FusedMoE._load_gguf_weight
+        # into the real w13_qweight/w2_qweight parameters.
+        layer.materialize_gguf_weights()
+        for param_name in ("w13_qweight", "w2_qweight"):
+            param = getattr(layer, param_name)
+            if isinstance(param, UninitializedParameter):
+                raise ValueError(
+                    f"No GGUF expert shards were loaded into {param_name}."
+                )
+            if param.shape[0] != param.tensor_shape[0]:
+                raise ValueError(
+                    f"{param_name} materialized {param.shape[0]} of "
+                    f"{param.tensor_shape[0]} experts; the GGUF checkpoint is "
+                    "missing expert shards."
+                )
+
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        assert self.fused_experts is None
-
+        # (An `assert self.fused_experts is None` vestige of the vLLM port
+        # used to live here; sglang's FusedMoEMethodBase has no such field.)
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert (
@@ -556,6 +792,14 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
         moe_runner_config = self.moe_runner_config
 
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        if not isinstance(topk_output, StandardTopKOutput):
+            raise ValueError(
+                f"GGUF MoE requires the standard TopK output, got "
+                f"{type(topk_output).__name__}; use a MoE runner backend that "
+                "does not bypass TopK (e.g. --moe-runner-backend auto)."
+            )
         topk_weights, topk_ids, _ = topk_output
         output = fused_moe_gguf(
             x=x,
@@ -566,7 +810,13 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             qweight_type=layer.w13_qweight_type.weight_type,
             qweight_type2=layer.w2_qweight_type.weight_type,
             activation=moe_runner_config.activation,
+            swiglu_limit=moe_runner_config.swiglu_limit,
         )
+        routed_scaling_factor = moe_runner_config.routed_scaling_factor
+        if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
+            # The MoE runners fold this into their final reduce; the GGUF
+            # kernels only weight by the (unscaled) topk weights.
+            output.mul_(routed_scaling_factor)
         return StandardCombineInput(hidden_states=output)
 
 

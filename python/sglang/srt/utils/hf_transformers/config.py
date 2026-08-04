@@ -231,6 +231,18 @@ def get_config(
                 "with GGUF inputs; only 'hf' (or 'auto') is supported."
             )
         _ensure_gguf_version()
+
+        # Architectures transformers' GGUF integration doesn't know get an
+        # sglang-side config builder instead.
+        from sglang.srt.utils.hf_transformers.gguf_arch import get_gguf_arch_adapter
+
+        gguf_arch_adapter = get_gguf_arch_adapter(model)
+        if gguf_arch_adapter is not None:
+            config = gguf_arch_adapter.build_config(model)
+            if model_override_args:
+                config.update(model_override_args)
+            return config
+
         kwargs["gguf_file"] = model
         model = Path(model).parent
         # Skip auto-resolution for GGUF: the name-based Mistral heuristic

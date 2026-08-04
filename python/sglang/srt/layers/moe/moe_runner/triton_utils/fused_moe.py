@@ -641,7 +641,9 @@ def _fused_moe_kernel_sequence(
 
             if not filter_expert:
                 if swiglu_limit_for_silu_and_mul_clamp is not None:
-                    from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
+                    from sglang.kernels.ops.activation.clamped_swiglu import (
+                        silu_and_mul_clamp,
+                    )
 
                     silu_and_mul_clamp(
                         intermediate_cache1.view(-1, N),

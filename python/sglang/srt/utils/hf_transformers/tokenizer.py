@@ -487,6 +487,27 @@ def get_tokenizer(
         if "use_fast" not in kwargs:
             kwargs["use_fast"] = True
 
+    if check_gguf_file(tokenizer_name):
+        # GGUF architectures transformers' tokenizer integration rejects are
+        # loaded via the sglang-side converter.
+        _ensure_gguf_version()
+        from sglang.srt.utils.hf_transformers.gguf_arch import get_gguf_arch_adapter
+
+        gguf_arch_adapter = get_gguf_arch_adapter(tokenizer_name)
+        if gguf_arch_adapter is not None:
+            if not kwargs.pop("use_fast", True):
+                logger.warning(
+                    "The GGUF embedded tokenizer is only available as a fast "
+                    "tokenizer; ignoring the slow-tokenizer request."
+                )
+            tokenizer = gguf_arch_adapter.build_tokenizer(tokenizer_name, **kwargs)
+            # Serving code reads these attributes unconditionally; apply the
+            # same post-load patches as _apply_post_load_fixes, minus the v5
+            # from_pretrained artifact fixes that re-read HF checkpoint files.
+            _fix_special_tokens_pattern(tokenizer)
+            attach_additional_stop_token_ids(tokenizer)
+            return patch_tokenizer(tokenizer)
+
     tokenizer_name = _resolve_tokenizer_name(tokenizer_name, kwargs)
 
     common_kwargs = dict(
