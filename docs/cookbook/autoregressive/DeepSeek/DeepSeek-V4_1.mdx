@@ -108,6 +108,10 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 Overriding them is the most common cause of a disappointing measurement: it leaves the 32-wide ue8m0 blocks on the Triton `_w8a8_block_fp8_matmul` fallback, which dominates the decode step and costs most of the model's bs=1 throughput. If your decode rate looks like a small fraction of what you expected, check the resolved backends first.
 
+### Cap the decode CUDA graphs
+
+Every cell above passes `--cuda-graph-max-bs-decode 64` wherever DSpark is on, and the H200 cells pass it on both recipes. Without it the derived batch list runs out of memory while capturing the decode graphs and the server never finishes starting — the failure is `Capture cuda graph failed: CUDA out of memory` from `decode_cuda_graph_runner`, not a runtime error you would see under load. If you assemble a command by hand rather than from the panel, carry that flag over. H200, the tightest board at 140 GiB, additionally needs `--mem-fraction-static 0.8`.
+
 ## 3. Advanced Usage
 
 ### 3.1 Reasoning
