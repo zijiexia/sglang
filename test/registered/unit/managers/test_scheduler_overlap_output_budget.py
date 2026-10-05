@@ -14,6 +14,7 @@ import importlib.util
 import unittest
 from collections import Counter, deque
 from enum import Enum, IntEnum, auto
+from http import HTTPStatus
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -141,7 +142,8 @@ class _Req:
         self.return_logprob = False
         self.prefix_indices = []
         self.extend_range = SimpleNamespace(end=1, length=1)
-        self.kv = SimpleNamespace(req_pool_idx=None)
+        self.origin_input_ids = [0]
+        self.kv = SimpleNamespace(req_pool_idx=None, kv_committed_len=0)
 
     def finished(self):
         return self._finished
@@ -170,6 +172,48 @@ class _Pool:
 
     def release(self, req):
         assert self.owners.pop(req.rid) is req, "released wrong/already released slot"
+
+
+class _TokenAllocator:
+    """Allocation/release boundary; production code decides capacity/retraction."""
+
+    page_size = 1
+
+    def __init__(self, capacity=10000):
+        self.capacity = capacity
+        self.owned = {}
+        self.checks = []
+        self.retractions = []
+
+    def available_size(self):
+        return self.capacity - sum(self.owned.values())
+
+    def check_decode_capacity(self, num_tokens, requests, **kwargs):
+        available = self.available_size()
+        self.checks.append((tuple(r.rid for r in requests), num_tokens, available))
+        return num_tokens <= available
+
+    def reserve(self, req, count):
+        assert count <= self.available_size(), (
+            "allocated before memory became available"
+        )
+        self.owned[req] = self.owned.get(req, 0) + count
+        req.kv.kv_committed_len = self.owned[req]
+
+    def release(self, req):
+        self.owned.pop(req)
+        req.kv.kv_committed_len = 0
+
+    def flush_opportunistic(self):
+        pass
+
+
+class _Abort:
+    def __init__(self, message, **kwargs):
+        self.message = message
+
+    def to_json(self):
+        return {"message": self.message}
 
 
 class _Batch:
@@ -212,7 +256,15 @@ class _Batch:
     def init_new(cls, reqs, pool, allocator, cache, config, overlap, spec, **kwargs):
         for req in reqs:
             pool.allocate(req)
-        return cls(reqs, model_config=config, spec_algorithm=spec, **kwargs)
+        return cls(
+            reqs,
+            model_config=config,
+            spec_algorithm=spec,
+            token_to_kv_pool_allocator=allocator,
+            tree_cache=cache,
+            req_to_token_pool=pool,
+            **kwargs,
+        )
 
     def prepare_for_extend(self):
         self.forward_mode = _Mode.EXTEND
@@ -227,7 +279,12 @@ class _Batch:
         self.merge_batch(other)
         self.forward_mode = _Mode.MIXED
 
-    def check_decode_mem(self):
+    def release_req(self, idx, remaining, **kwargs):
+        req = self.reqs[idx]
+        self.token_to_kv_pool_allocator.retractions.append(req.rid)
+        self.token_to_kv_pool_allocator.release(req)
+        self.req_to_token_pool.release(req)
+        req.is_retracted = True
         return True
 
     def grammar_needs_sync(self):
@@ -269,7 +326,17 @@ def _load_methods(envs, parallel, *, cuda=True, logs=None):
         deque=deque,
         envs=envs,
         get_parallel=lambda: parallel,
-        get_schedule=lambda: SimpleNamespace(prefill_max_requests=None),
+        get_schedule=lambda: SimpleNamespace(
+            prefill_max_requests=None, retraction_policy="length"
+        ),
+        NewTokenRatioTracker=SimpleNamespace(
+            estimate_new_token_ratio_after_retract=lambda reqs: 1.0
+        ),
+        beam_retraction_order=lambda indices, reqs: indices,
+        num_beam_member_rows=lambda reqs: 0,
+        FINISH_ABORT=_Abort,
+        HTTPStatus=HTTPStatus,
+        _make_abort_req=lambda req, **kwargs: req,
         is_cuda=lambda: cuda,
         DisaggregationMode=_Disaggregation,
         ForwardMode=_Mode,
@@ -296,13 +363,25 @@ def _load_methods(envs, parallel, *, cuda=True, logs=None):
         ),
         logger=SimpleNamespace(
             info=lambda message: logs.append(("info", message)),
-            warning=lambda message: logs.append(("warning", message)),
+            warning=lambda message, *args: logs.append(
+                ("warning", message % args if args else message)
+            ),
         ),
     )
     batch_nodes = _class_methods(
         _BATCH_SOURCE,
         "ScheduleBatch",
-        {"filter_batch", "copy", "merge_batch", "batch_size", "is_empty"},
+        {
+            "filter_batch",
+            "copy",
+            "merge_batch",
+            "batch_size",
+            "is_empty",
+            "check_decode_mem",
+            "new_tokens_required_next_decode",
+            "retract_decode",
+            "_get_decode_retraction_order",
+        },
     )
     copy_node = next(node for node in batch_nodes if node.name == "copy")
     _Batch._copy_fields = {
@@ -316,6 +395,7 @@ def _load_methods(envs, parallel, *, cuda=True, logs=None):
         setattr(_Batch, name, method)
     scheduler_names = {
         "event_loop_overlap",
+        "_init_overlap_output_budget",
         "is_disable_overlap_for_batch",
         "get_next_batch_to_run",
         "get_num_allocatable_reqs",
@@ -323,7 +403,6 @@ def _load_methods(envs, parallel, *, cuda=True, logs=None):
         "_get_new_batch_prefill_raw",
         "update_running_batch",
         "_filter_running_batch",
-        "collect_inflight_reqs",
     }
     return _compile_methods(
         _class_methods(_SCHEDULER_SOURCE, "Scheduler", scheduler_names),
@@ -337,6 +416,7 @@ class _Runtime:
         for name, method in methods.items():
             setattr(self, name, MethodType(method, self))
         self.is_generation = self.enable_overlap = True
+        self.enable_pdmux = self.enable_overlap_mlx = False
         self.enable_overlap_output_budget = False
         self.max_running_requests = capacity or len(caps)
         self.require_mlp_sync = self.enable_hisparse = False
@@ -364,10 +444,18 @@ class _Runtime:
         self.iterations = self.serial = self.idle_count = 0
         # The physical pool is larger than the scheduling limit, as on a server.
         self.req_to_token_pool = _Pool(self.max_running_requests + 1)
-        self.token_to_kv_pool_allocator = SimpleNamespace(
-            flush_opportunistic=lambda: None
+        self.token_to_kv_pool_allocator = _TokenAllocator()
+        self.aborted = []
+        self.decode_offload_manager = None
+        self.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        self.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(
+                send_output=lambda output, req: self.aborted.append(req.rid)
+            )
         )
-        self.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
+        self.beam_coordinator = SimpleNamespace(
+            pending_member_rows=lambda batch: 0, retire_group=lambda req: None
+        )
         self.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=lambda batch, **kwargs: batch,
             maybe_convert_decode_to_extend=lambda batch: batch,
@@ -393,10 +481,15 @@ class _Runtime:
             shortest_prefill_chunk_limit=lambda *args: 1,
         )
         self.tree_cache = SimpleNamespace(
-            buffer_pipeline=None, storage_prefetch_retries=None
+            buffer_pipeline=None,
+            storage_prefetch_retries=None,
+            req_to_token_pool=self.req_to_token_pool,
         )
         self.load_inquirer = SimpleNamespace(_get_num_pending_tokens=lambda **kwargs: 0)
         self.on_ingest = None
+
+    def _add_request_to_queue(self, req, **kwargs):
+        self.waiting_queue.append(req)
 
     def process_pending_chunked_abort(self):
         pass
@@ -427,6 +520,7 @@ class _Runtime:
         for req in batch.reqs:
             assert not req.finished(), "planned work after final result commit"
             assert self.req_to_token_pool.owners.get(req.rid) is req
+            self.token_to_kv_pool_allocator.reserve(req, 1)
             if req.prefills_left > 0:
                 req.prefills_left -= 1
             produces_token = req.prefills_left == 0
@@ -469,6 +563,7 @@ class _Runtime:
             ):
                 req._finished = True
                 self.req_to_token_pool.release(req)
+                self.token_to_kv_pool_allocator.release(req)
                 self.releases[req.rid] += 1
                 self.trace.append(("release", req.rid, result.serial))
 
@@ -505,6 +600,7 @@ class TestSchedulerOverlapOutputBudget(CustomTestCase):
             self.envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(consecutive),
             self.envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(0),
         ):
+            runtime._init_overlap_output_budget()
             runtime.event_loop_overlap()
         self.assertEqual(len(runtime.processed), runtime.serial)
         self.assertEqual(
@@ -513,6 +609,8 @@ class TestSchedulerOverlapOutputBudget(CustomTestCase):
         self.assertFalse(runtime.result_queue)
         self.assertIsNone(runtime.last_batch)
         self.assertFalse(runtime.req_to_token_pool.owners)
+        self.assertFalse(runtime.token_to_kv_pool_allocator.owned)
+        self.assertFalse(runtime.aborted)
         self.assertLessEqual(
             runtime.req_to_token_pool.peak_owners, runtime.max_running_requests
         )
@@ -668,7 +766,12 @@ class TestSchedulerOverlapOutputBudget(CustomTestCase):
                 runtime = self._make_runtime(**kwargs)
                 if not kwargs:
                     setattr(runtime, name, value)
-                self._run(runtime)
+                if name == "spec_algorithm":
+                    # Specialized allocation math is outside this ordinary fixture.
+                    with self.envs.SGLANG_ENABLE_OVERLAP_OUTPUT_BUDGET.override(True):
+                        runtime._init_overlap_output_budget()
+                else:
+                    self._run(runtime)
                 self.assertFalse(runtime.enable_overlap_output_budget)
                 self.assertEqual(
                     runtime.logs,
@@ -679,7 +782,234 @@ class TestSchedulerOverlapOutputBudget(CustomTestCase):
                         )
                     ],
                 )
-                self.assertEqual(len(runtime.launches), 3)
+                if name != "spec_algorithm":
+                    self.assertEqual(len(runtime.launches), 3)
+
+    def _pressure_runtime(self, caps=(2, 8)):
+        runtime = self._make_runtime(caps)
+        runtime.waiting_queue.clear()
+        runtime.token_to_kv_pool_allocator.capacity = 11 + 7 * (len(caps) - 1)
+
+        def seed_pending(s):
+            if s.iterations != 1:
+                return
+            rows = []
+            for index, req in enumerate(s.requests):
+                committed = 1 if index == 0 else 3
+                req.output_ids = list(range(1, committed + 1))
+                req.origin_input_ids = [0] * (10 if index == 0 else 4)
+                req.prefills_left = 0
+                req.tokens_issued = committed + 1
+                s.req_to_token_pool.allocate(req)
+                s.token_to_kv_pool_allocator.reserve(req, 11 if index == 0 else 7)
+                rows.append((req, committed + 1, True))
+            batch = _Batch(
+                s.requests,
+                forward_iter=1,
+                token_to_kv_pool_allocator=s.token_to_kv_pool_allocator,
+                req_to_token_pool=s.req_to_token_pool,
+                tree_cache=s.tree_cache,
+            )
+            s.running_batch = s.last_batch = batch
+            s.serial = 1
+            s.launches = [(req.rid, _Mode.DECODE, 1) for req in s.requests]
+            s.result_queue = deque(
+                [(batch.copy(), SimpleNamespace(serial=1, rows=rows, sampled=True))]
+            )
+
+        runtime.on_ingest = seed_pending
+        return runtime
+
+    def test_pending_terminal_memory_defers_survivors_then_resumes(self):
+        for caps in ((2, 8), (2, 8, 8), (2,)):
+            with self.subTest(caps=caps):
+                runtime = self._pressure_runtime(caps)
+                planner = runtime.get_next_batch_to_run
+                observations = []
+
+                def observe_plan(**kwargs):
+                    plan = planner(**kwargs)
+                    observations.append(
+                        (
+                            plan.batch_to_run,
+                            tuple(req.rid for req in plan.running_batch.reqs),
+                            dict(runtime.token_to_kv_pool_allocator.owned),
+                        )
+                    )
+                    return plan
+
+                runtime.get_next_batch_to_run = observe_plan
+                self._run(runtime)
+                first_compute, retained, owned = observations[0]
+                self.assertIsNone(first_compute)
+                self.assertEqual(retained, tuple(str(i) for i in range(1, len(caps))))
+                self.assertEqual(owned[runtime.requests[0]], 11)
+                self.assertFalse(runtime.token_to_kv_pool_allocator.retractions)
+                self.assertFalse(runtime.aborted)
+                for req in runtime.requests:
+                    self.assertIsNone(req.to_finish)
+                    self.assertEqual(
+                        len(req.output_ids), req.sampling_params.max_new_tokens
+                    )
+                self.assertEqual(runtime.trace.count(("process", 1)), 1)
+                self.assertEqual(runtime.trace.count(("release", "0", 1)), 1)
+                if len(caps) > 1:
+                    second_launch = next(
+                        e for e in runtime.trace if e[:2] == ("launch", 2)
+                    )
+                    self.assertLess(
+                        runtime.trace.index(("process", 1)),
+                        runtime.trace.index(second_launch),
+                    )
+                    self.assertEqual(set(second_launch[2]), set(retained))
+                    self.assertEqual(runtime.token_to_kv_pool_allocator.checks[0][2], 0)
+                else:
+                    self.assertEqual(runtime.serial, 1)
+                    self.assertFalse(runtime.token_to_kv_pool_allocator.checks)
+
+    def test_ordinary_pressure_keeps_existing_retraction(self):
+        for enabled, caps in ((False, (2, 8)), (True, (8, 8))):
+            with self.subTest(enabled=enabled, caps=caps):
+                runtime = self._pressure_runtime(caps)
+                runtime.ingest_requests()
+                with self.envs.SGLANG_ENABLE_OVERLAP_OUTPUT_BUDGET.override(enabled):
+                    runtime._init_overlap_output_budget()
+                plan = runtime.get_next_batch_to_run(
+                    running_batch=runtime.running_batch, last_batch=runtime.last_batch
+                )
+                self.assertEqual(plan.batch_to_run.reqs, [runtime.requests[1]])
+                self.assertEqual(runtime.token_to_kv_pool_allocator.retractions, ["0"])
+                self.assertEqual(runtime.waiting_queue, [runtime.requests[0]])
+                self.assertEqual(
+                    runtime.token_to_kv_pool_allocator.owned, {runtime.requests[1]: 7}
+                )
+                self.assertFalse(runtime.aborted)
+                self.assertEqual(runtime.result_queue[0][0].reqs, runtime.requests)
+
+    def _stubbed_dispatch(self, runtime):
+        source = ast.parse(_SCHEDULER_SOURCE.read_text())
+        dispatch_node = next(
+            node
+            for node in source.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_dispatch_event_loop_once"
+        )
+        dispatch = _compile_methods(
+            [dispatch_node],
+            _SCHEDULER_SOURCE,
+            runtime._init_overlap_output_budget.__func__.__globals__,
+        )["_dispatch_event_loop_once"]
+        selected = []
+        for loop in (
+            "event_loop_overlap",
+            "event_loop_normal",
+            "event_loop_pp",
+            "event_loop_pdmux",
+            "event_loop_overlap_mlx",
+            "event_loop_overlap_disagg_prefill",
+            "event_loop_normal_disagg_prefill",
+            "event_loop_pp_disagg_prefill",
+            "event_loop_overlap_disagg_decode",
+            "event_loop_normal_disagg_decode",
+            "event_loop_pp_disagg_decode",
+        ):
+            setattr(runtime, loop, lambda name=loop: selected.append(name))
+        return lambda: dispatch(runtime), selected
+
+    def test_real_dispatch_selects_loop_and_reports_eligibility(self):
+        cases = [
+            ({}, {}, "event_loop_overlap", True),
+            ({"enable_overlap": False}, {}, "event_loop_normal", False),
+            ({}, {"pp_size": 2}, "event_loop_pp", False),
+            ({"enable_pdmux": True}, {}, "event_loop_pdmux", False),
+            (
+                {"enable_overlap": False, "enable_overlap_mlx": True},
+                {},
+                "event_loop_overlap_mlx",
+                False,
+            ),
+        ]
+        for mode, role in (
+            (_Disaggregation.PREFILL, "prefill"),
+            (_Disaggregation.DECODE, "decode"),
+        ):
+            cases.extend(
+                [
+                    (
+                        {"disaggregation_mode": mode},
+                        {},
+                        f"event_loop_overlap_disagg_{role}",
+                        False,
+                    ),
+                    (
+                        {"disaggregation_mode": mode, "enable_overlap": False},
+                        {},
+                        f"event_loop_normal_disagg_{role}",
+                        False,
+                    ),
+                    (
+                        {"disaggregation_mode": mode},
+                        {"pp_size": 2},
+                        f"event_loop_pp_disagg_{role}",
+                        False,
+                    ),
+                ]
+            )
+        for attrs, parallel, loop, supported in cases:
+            for requested in (False, True):
+                with self.subTest(loop=loop, requested=requested):
+                    runtime = self._make_runtime(parallel=parallel)
+                    for key, value in attrs.items():
+                        setattr(runtime, key, value)
+                    dispatch, selected = self._stubbed_dispatch(runtime)
+                    with self.envs.SGLANG_ENABLE_OVERLAP_OUTPUT_BUDGET.override(
+                        requested
+                    ):
+                        dispatch()
+                    self.assertEqual(selected, [loop])
+                    self.assertIs(
+                        runtime.enable_overlap_output_budget, requested and supported
+                    )
+                    expected = []
+                    if requested:
+                        expected = (
+                            [("info", "Overlap output budget enabled.")]
+                            if supported
+                            else [
+                                (
+                                    "warning",
+                                    "Overlap output budget requested but disabled: unsupported scheduler configuration.",
+                                )
+                            ]
+                        )
+                    self.assertEqual(runtime.logs, expected)
+
+    def test_redispatch_clears_stale_enabled_state(self):
+        runtime = self._make_runtime()
+        dispatch, selected = self._stubbed_dispatch(runtime)
+        with self.envs.SGLANG_ENABLE_OVERLAP_OUTPUT_BUDGET.override(True):
+            dispatch()
+            self.assertTrue(runtime.enable_overlap_output_budget)
+            runtime.disaggregation_mode = _Disaggregation.PREFILL
+            dispatch()
+            self.assertFalse(runtime.enable_overlap_output_budget)
+            runtime.disaggregation_mode = _Disaggregation.NULL
+            dispatch()
+            self.assertTrue(runtime.enable_overlap_output_budget)
+        previous_logs = list(runtime.logs)
+        with self.envs.SGLANG_ENABLE_OVERLAP_OUTPUT_BUDGET.override(False):
+            dispatch()
+        self.assertFalse(runtime.enable_overlap_output_budget)
+        self.assertEqual(runtime.logs, previous_logs)
+        self.assertEqual(
+            selected,
+            [
+                "event_loop_overlap",
+                "event_loop_overlap_disagg_prefill",
+                "event_loop_overlap",
+                "event_loop_overlap",
+            ],
+        )
 
     def test_pending_identity_and_request_fallbacks(self):
         def setup():

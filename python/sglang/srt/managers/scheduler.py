@@ -1939,24 +1939,17 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
-    @DynamicGradMode()
-    def event_loop_overlap(self):
-        """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        self.result_queue: Deque[
-            Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
-        ] = deque()
-
-        def pop_and_process():
-            # Process the results of the last batch
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
-
+    def _init_overlap_output_budget(self) -> None:
+        # Recompute at dispatch, including after a PD role switch, so unsupported
+        # event loops cannot inherit enabled state from the ordinary overlap loop.
         output_budget_requested = envs.SGLANG_ENABLE_OVERLAP_OUTPUT_BUDGET.get()
         self.enable_overlap_output_budget = (
             output_budget_requested
             and is_cuda()
             and self.is_generation
             and self.enable_overlap
+            and not self.enable_pdmux
+            and not self.enable_overlap_mlx
             and get_parallel().tp_size == 1
             and get_parallel().pp_size == 1
             and getattr(get_parallel(), "dp_size", None) == 1
@@ -1979,6 +1972,18 @@ class Scheduler(
                     "Overlap output budget requested but disabled: "
                     "unsupported scheduler configuration."
                 )
+
+    @DynamicGradMode()
+    def event_loop_overlap(self):
+        """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        self.result_queue: Deque[
+            Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
+        ] = deque()
+
+        def pop_and_process():
+            # Process the results of the last batch
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
             if self.gracefully_exit:
@@ -3782,8 +3787,15 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
-                running_batch = self.update_running_batch(running_batch)
-                ret = running_batch if not running_batch.is_empty() else None
+                decode_batch = self.update_running_batch(running_batch)
+                # None defers compute without dropping the surviving requests.
+                if decode_batch is not None:
+                    running_batch = decode_batch
+                ret = (
+                    decode_batch
+                    if decode_batch is not None and not decode_batch.is_empty()
+                    else None
+                )
             else:
                 ret = None
 
@@ -4221,12 +4233,13 @@ class Scheduler(
                 new_lora_set
             )
 
-    def _filter_running_batch(self, batch: ScheduleBatch) -> None:
+    def _filter_running_batch(self, batch: ScheduleBatch) -> bool:
+        """Filter rows and report whether pending terminal requests were excluded."""
         # Keep pending terminal requests in admission accounting until decode
         # preparation. Their result snapshots still own the final output and KV.
         if not self.enable_overlap_output_budget or len(self.result_queue) != 1:
             batch.filter_batch()
-            return
+            return False
 
         pending_batch, _ = self.result_queue[0]
         if (
@@ -4240,7 +4253,7 @@ class Scheduler(
             )
         ):
             batch.filter_batch()
-            return
+            return False
 
         # The ordinary PP1 overlap loop has one previous result at this point.
         # Each non-spec decode or final prefill contributes one pending output;
@@ -4258,22 +4271,31 @@ class Scheduler(
             and req.sampling_params.max_new_tokens > 0
             and len(req.output_ids) + 1 >= req.sampling_params.max_new_tokens
         }
+        excluded_terminal_reqs = any(req in terminal_reqs for req in batch.reqs)
         initial_bs = batch.batch_size()
         batch.filter_batch(chunked_req_to_exclude=terminal_reqs)
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
+        return excluded_terminal_reqs
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
-        """Update the current running decoding batch."""
+        """Prepare decode, or return None to defer compute while retaining the batch."""
         initial_bs = batch.batch_size()
 
-        self._filter_running_batch(batch)
+        excluded_terminal_reqs = self._filter_running_batch(batch)
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
 
+        kv_full_retract_flag = not batch.check_decode_mem()
+        if excluded_terminal_reqs and kv_full_retract_flag:
+            # Terminal KV is still owned by the pending result. Let the ordinary
+            # overlap loop consume it before retrying, rather than retracting or
+            # aborting survivors while that memory is unavailable.
+            return None
+
         # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+        if kv_full_retract_flag or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             if self.decode_offload_manager is not None:
@@ -5855,6 +5877,7 @@ def dispatch_event_loop(scheduler: Scheduler):
 
 
 def _dispatch_event_loop_once(scheduler: Scheduler):
+    scheduler._init_overlap_output_budget()
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
