@@ -3673,7 +3673,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def filter_batch(
         self,
-        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
+        chunked_req_to_exclude: Optional[Union[Req, List[Req], Set[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
         strip_beam_tail(self)

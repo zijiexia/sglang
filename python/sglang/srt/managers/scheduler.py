@@ -1292,6 +1292,7 @@ class Scheduler(
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
+        self.enable_overlap_output_budget = False
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -1949,6 +1950,35 @@ class Scheduler(
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+
+        output_budget_requested = envs.SGLANG_ENABLE_OVERLAP_OUTPUT_BUDGET.get()
+        self.enable_overlap_output_budget = (
+            output_budget_requested
+            and is_cuda()
+            and self.is_generation
+            and self.enable_overlap
+            and get_parallel().tp_size == 1
+            and get_parallel().pp_size == 1
+            and getattr(get_parallel(), "dp_size", None) == 1
+            and not self.require_mlp_sync
+            and self.spec_algorithm.is_none()
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and self.dllm_config is None
+            and not self.enable_hisparse
+            and not self.enable_unified_memory
+            and not self.enable_priority_preemption
+            and not self.is_hybrid_swa
+            and not self.is_hybrid_ssm
+            and not self.model_config.is_encoder_decoder
+        )
+        if output_budget_requested:
+            if self.enable_overlap_output_budget:
+                logger.info("Overlap output budget enabled.")
+            else:
+                logger.warning(
+                    "Overlap output budget requested but disabled: "
+                    "unsupported scheduler configuration."
+                )
 
         while True:
             if self.gracefully_exit:
@@ -4139,7 +4169,7 @@ class Scheduler(
             and all(r.beam_group is None for r in running_batch.reqs)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            running_batch.filter_batch()
+            self._filter_running_batch(running_batch)
             if not running_batch.is_empty():
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
@@ -4191,11 +4221,53 @@ class Scheduler(
                 new_lora_set
             )
 
+    def _filter_running_batch(self, batch: ScheduleBatch) -> None:
+        # Keep pending terminal requests in admission accounting until decode
+        # preparation. Their result snapshots still own the final output and KV.
+        if not self.enable_overlap_output_budget or len(self.result_queue) != 1:
+            batch.filter_batch()
+            return
+
+        pending_batch, _ = self.result_queue[0]
+        if (
+            self.last_batch is None
+            or pending_batch.forward_iter is None
+            or pending_batch.forward_iter != self.last_batch.forward_iter
+            or not pending_batch.spec_algorithm.is_none()
+            or not (
+                pending_batch.forward_mode.is_decode()
+                or pending_batch.forward_mode.is_extend()
+            )
+        ):
+            batch.filter_batch()
+            return
+
+        # The ordinary PP1 overlap loop has one previous result at this point.
+        # Each non-spec decode or final prefill contributes one pending output;
+        # middle prefill chunks are skipped just as in process_batch_result_prefill.
+        terminal_reqs = {
+            req
+            for req in pending_batch.reqs
+            if req.beam_group is None
+            and req.grammar is None
+            and not req.finished()
+            and req.to_finish is None
+            and not req.is_retracted
+            and req.inflight_middle_chunks == 0
+            and req.sampling_params.max_new_tokens is not None
+            and req.sampling_params.max_new_tokens > 0
+            and len(req.output_ids) + 1 >= req.sampling_params.max_new_tokens
+        }
+        initial_bs = batch.batch_size()
+        batch.filter_batch(chunked_req_to_exclude=terminal_reqs)
+        if batch.batch_size() < initial_bs:
+            batch.batch_is_full = False
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
-        batch.filter_batch()
+        self._filter_running_batch(batch)
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
