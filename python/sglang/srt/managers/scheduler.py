@@ -1950,6 +1950,34 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        c1_terminal_decode_drain_requested = (
+            envs.SGLANG_ENABLE_C1_TERMINAL_DECODE_DRAIN.get()
+        )
+        enable_c1_terminal_decode_drain = (
+            c1_terminal_decode_drain_requested
+            and is_cuda()
+            and self.is_generation
+            and self.enable_overlap
+            and self.max_running_requests == 1
+            and get_parallel().tp_size == 1
+            and get_parallel().pp_size == 1
+            and getattr(get_parallel(), "dp_size", None) == 1
+            and not self.require_mlp_sync
+            and self.spec_algorithm.is_none()
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and self.dllm_config is None
+            and not self.enable_hisparse
+            and not self.enable_unified_memory
+        )
+        if c1_terminal_decode_drain_requested:
+            if enable_c1_terminal_decode_drain:
+                logger.info("C1 terminal decode drain enabled.")
+            else:
+                logger.warning(
+                    "C1 terminal decode drain requested but disabled: "
+                    "unsupported scheduler configuration."
+                )
+
         while True:
             if self.gracefully_exit:
                 break
@@ -1959,6 +1987,14 @@ class Scheduler(
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
+
+            previous_result_processed = False
+            if (
+                enable_c1_terminal_decode_drain
+                and self._should_drain_c1_terminal_decode()
+            ):
+                pop_and_process()
+                previous_result_processed = True
 
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
@@ -1973,7 +2009,7 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and not previous_result_processed:
                 pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
@@ -1996,7 +2032,7 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not previous_result_processed:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -2012,6 +2048,39 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _should_drain_c1_terminal_decode(self) -> bool:
+        if len(self.result_queue) != 1 or self.last_batch is None:
+            return False
+        pending_batch, _ = self.result_queue[0]
+        batches = (pending_batch, self.last_batch, self.running_batch)
+        if any(
+            batch is None
+            or len(batch.reqs) != 1
+            or not batch.forward_mode.is_decode()
+            or not batch.spec_algorithm.is_none()
+            for batch in batches
+        ):
+            return False
+        if pending_batch.forward_iter is None or any(
+            batch.forward_iter != pending_batch.forward_iter for batch in batches[1:]
+        ):
+            return False
+        req = pending_batch.reqs[0]
+        if any(batch.reqs[0] is not req for batch in batches[1:]):
+            return False
+        max_new_tokens = req.sampling_params.max_new_tokens
+        return (
+            req.beam_group is None
+            and req.grammar is None
+            and not req.finished()
+            and req.to_finish is None
+            and not req.is_retracted
+            and req.inflight_middle_chunks == 0
+            and max_new_tokens is not None
+            and len(req.output_ids) > 0
+            and len(req.output_ids) + 1 == max_new_tokens
+        )
 
     def is_disable_overlap_for_batch(
         self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]

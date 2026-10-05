@@ -643,6 +643,8 @@ class Envs:
     # Overlap scheduler and pipeline parallelism
     # ===================================================================
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    # Drain the final pending decode before scheduling another step for C1.
+    SGLANG_ENABLE_C1_TERMINAL_DECODE_DRAIN = EnvBool(False)
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
