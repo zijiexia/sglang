@@ -1283,6 +1283,11 @@ class MiniMaxM3Attention(nn.Module):
         return q, k, idx_q, idx_k
 
     @staticmethod
+    def _is_sparse_kv_cached_by_fusion(forward_batch: ForwardBatch, layer_id: int):
+        layer_ids = forward_batch.minimax_m3_precached_sparse_layers
+        return layer_ids is not None and layer_id in layer_ids
+
+    @staticmethod
     def _mark_sparse_kv_cached_by_fusion(
         forward_batch: ForwardBatch, layer_id: int
     ) -> None:
@@ -1555,6 +1560,23 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if getattr(hidden_states, "is_low_batch_front_output", False):
+            # The fused attention front already ran the QKV projection, head
+            # norms and RoPE and stored K/V and index-K; the queries are FP8.
+            rows = hidden_states.q_fp8.shape[0]
+            unused = hidden_states.q_fp8.new_empty(
+                (rows, self.head_dim), dtype=torch.bfloat16
+            )
+            inner_state = (
+                hidden_states.q_fp8,
+                unused,
+                unused,
+                hidden_states.index_q_fp8,
+                unused,
+                None,
+                forward_batch,
+            )
+            return None, forward_batch, inner_state
         fused_out = None
         if self._fused_qkv_index is not None:
             fused_out = self.fused_qkv_index_proj(hidden_states)
@@ -1700,6 +1722,11 @@ class MiniMaxM3Attention(nn.Module):
             if idx_v is not None:
                 idx_v = idx_v.reshape(idx_v.shape[0], 1, self.idx_head_dim)
             extra = _hip.sparse_attn_kwargs(self, forward_batch, q) if _is_hip else {}
+            if not _is_hip and self._is_sparse_kv_cached_by_fusion(
+                forward_batch, self.attn.layer_id
+            ):
+                # The fused attention front stored K/V and index-K already.
+                extra["save_kv_cache"] = False
             idx_o, attn_output = self.attn(
                 q, k, v, forward_batch, idx_q=idx_q, idx_k=idx_k, idx_v=idx_v, **extra
             )
@@ -1847,6 +1874,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 defers_finalize=self.is_layer_sparse
                 and self.mlp.supports_deferred_finalize,
             )
+            if (
+                envs.SGLANG_MINIMAX_M3_LOW_BATCH_FRONT.get()
+                and self.self_attn.is_sparse_attention_layer
+            ):
+                from sglang.srt.models.minimax_common.nvidia.low_batch_front import (
+                    layer as low_batch_front,
+                )
+
+                options["fusions"].attn_front = partial(low_batch_front.try_run, self)
         attn, ffn = self.stage_facts(config, layer_id)
         if self._norm_quant is not None:
             ffn = dataclasses.replace(ffn, read=self._norm_quant.ffn_read())
@@ -2175,6 +2211,13 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
             # Decode and verify batches up to 341 rows at hidden 6144.
             register_fused_all_reduce_comm(max_push_size=4 * 1024 * 1024)
+        if envs.SGLANG_MINIMAX_M3_LOW_BATCH_FRONT.get() and _uses_push_plane_fusion():
+            from sglang.srt.models.minimax_common.nvidia.low_batch_front import (
+                layer as low_batch_front,
+            )
+
+            # Collective over the TP group, before graph capture.
+            low_batch_front.build_fronts(self.model)
 
     @torch.no_grad()
     def forward(

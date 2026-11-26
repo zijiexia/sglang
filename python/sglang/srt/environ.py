@@ -2515,6 +2515,12 @@ class Envs:
     SGLANG_MINIMAX_M3_LOW_BATCH_MOE = EnvBool(False)
     # Debug: also run the stock routed MoE on eager low-batch calls and log the output error.
     SGLANG_MINIMAX_M3_LOW_BATCH_MOE_COMPARE = EnvBool(False)
+    # MiniMax-M3.1-Flash TP4 SM100: fused attention front at 1-16 decode rows (the
+    # previous MoE's finalize + all-reduce + norm, QKV, head norms, RoPE and NVFP4
+    # K/V + index-K stores in one launch).
+    SGLANG_MINIMAX_M3_LOW_BATCH_FRONT = EnvBool(False)
+    # Debug: also run the stock boundary + QKV + stores on eager front calls and log the error.
+    SGLANG_MINIMAX_M3_LOW_BATCH_FRONT_COMPARE = EnvBool(False)
 
     # MiniMax-M3 sparse-attention toggles for ROCm.
     # Share one index top-k across every N sparse layers; 1 (default) disables
