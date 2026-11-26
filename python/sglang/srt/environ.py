@@ -2492,6 +2492,9 @@ class Envs:
     # MiniMax M3
     # ===================================================================
     SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
+    # Rows up to which the BF16 router runs the tiny GEMM instead of cuBLAS; 0 keeps the
+    # generic cap (16). The 128x6144 gate stays faster on the tiny GEMM through 64 rows on GB300.
+    SGLANG_MINIMAX_M3_TINY_ROUTER_MAX_TOKENS = EnvInt(0)
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
     SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
