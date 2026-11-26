@@ -10,7 +10,7 @@ is the one ``register_fused_all_reduce_comm`` registered before graph capture.
 from __future__ import annotations
 
 from functools import partial
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -55,9 +55,14 @@ class CustomAllReduceFusion:
         self.hidden_size = int(hidden_size)
         self.defers_finalize = defers_finalize
         self.final_norm_eps: Optional[float] = None
+        # A model's fused attention front: (handoff, residual, forward_batch) ->
+        # (attention input, residual) or None. It takes the attention input
+        # boundary before the finalize + all-reduce + norm.
+        self.attn_front: Optional[Callable] = None
 
     def attn_input_fusions(self, plan) -> tuple:
-        return (
+        front = (partial(self._attn_front, plan),) if self.attn_front else ()
+        return front + (
             partial(self._finalize_add_norm, plan),
             partial(self._all_reduce_add_norm, plan),
         )
@@ -117,6 +122,15 @@ class CustomAllReduceFusion:
         if post_residual_addition is not None:
             residual = residual + post_residual_addition
         return self._run_finalize(owed, residual, gamma, plan.norm.variance_epsilon)
+
+    def _attn_front(self, plan, owed, residual, forward_batch, post_residual_addition):
+        if (
+            post_residual_addition is not None
+            or not isinstance(owed, MoeDeferredFinalize)
+            or not self._eligible(plan, forward_batch, owed.m)
+        ):
+            return None
+        return self.attn_front(owed, residual, forward_batch)
 
     def _all_reduce_add_norm(
         self, plan, owed, residual, forward_batch, post_residual_addition
