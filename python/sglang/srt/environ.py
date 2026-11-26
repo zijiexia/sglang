@@ -2509,6 +2509,12 @@ class Envs:
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
+    # TP4 MiniMax-M3.1-Flash decode at 1-32 rows: routing + per-token NVFP4 input, FC1 (SwiGLU-OAI,
+    # per-tile NVFP4 h) and FC2 (overlapping FC1 above 8 rows) in three CuTe DSL launches ported from
+    # vLLM's low-batch MoE, instead of the FlashInfer TRT-LLM-gen routed MoE chain.
+    SGLANG_MINIMAX_M3_LOW_BATCH_MOE = EnvBool(False)
+    # Debug: also run the stock routed MoE on eager low-batch calls and log the output error.
+    SGLANG_MINIMAX_M3_LOW_BATCH_MOE_COMPARE = EnvBool(False)
 
     # MiniMax-M3 sparse-attention toggles for ROCm.
     # Share one index top-k across every N sparse layers; 1 (default) disables

@@ -683,10 +683,42 @@ class MiniMaxM3MoE(nn.Module):
         self, hidden_states: torch.Tensor, *, defer_finalize: bool = False
     ):
         router_logits = self._compute_router_logits(hidden_states)
+        if defer_finalize:
+            low_batch = self._forward_low_batch_experts(hidden_states, router_logits)
+            if low_batch is not None:
+                return low_batch
         topk_output = self.topk(hidden_states, router_logits)
         if defer_finalize:
             return self.experts.forward_deferred_finalize(hidden_states, topk_output)
         return self.experts(hidden_states, topk_output)
+
+    def _forward_low_batch_experts(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ):
+        """The deferred routed output from the low-batch MoE kernels at 1-32
+        rows (SGLANG_MINIMAX_M3_LOW_BATCH_MOE), or None for the stock path."""
+        from sglang.srt.models.minimax_common.nvidia.low_batch_moe import layer
+
+        rows = hidden_states.shape[0]
+        if not (layer.enabled() and 0 < rows <= layer.MAX_ROWS):
+            return None
+        low_batch = layer.get_low_batch_moe(self)
+        if low_batch is None:
+            return None
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            _make_deferred_finalize_output,
+        )
+
+        out = low_batch.run(hidden_states.contiguous(), router_logits)
+        if (
+            envs.SGLANG_MINIMAX_M3_LOW_BATCH_MOE_COMPARE.get()
+            and not get_is_capture_mode()
+        ):
+            ref = self.experts.forward_deferred_finalize(
+                hidden_states, self.topk(hidden_states, router_logits)
+            )
+            layer.log_compare(self, rows, out, ref)
+        return _make_deferred_finalize_output(out, top_k=out[1].shape[1])
 
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
