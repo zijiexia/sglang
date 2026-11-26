@@ -82,7 +82,9 @@ def get_low_batch_o_proj(attn) -> Optional[LowBatchOProj]:
     reason = _unsupported_reason(attn.o_proj)
     if reason is not None:
         logger.warning(
-            "MiniMax-M3 low-batch o_proj off for layer %s: %s", attn.layer_id, reason
+            "MiniMax-M3 low-batch o_proj off for layer %s: %s",
+            attn.attn.layer_id,
+            reason,
         )
         attn._low_batch_o_proj = None
         return None
@@ -106,7 +108,7 @@ def log_compare(attn, rows: int, out: torch.Tensor, ref: torch.Tensor) -> None:
     cos = torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0)
     logger.info(
         "m3_lowbatch_oproj compare layer=%s rows=%d cos=%.6f max_abs=%.4g ref_max=%.4g",
-        attn.layer_id,
+        attn.attn.layer_id,
         rows,
         cos.item(),
         (a - b).abs().max().item(),
