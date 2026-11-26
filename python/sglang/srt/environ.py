@@ -2515,6 +2515,11 @@ class Envs:
     SGLANG_MINIMAX_M3_LOW_BATCH_MOE = EnvBool(False)
     # Debug: also run the stock routed MoE on eager low-batch calls and log the output error.
     SGLANG_MINIMAX_M3_LOW_BATCH_MOE_COMPARE = EnvBool(False)
+    # TP4 MiniMax-M3.1-Flash decode at 1-32 rows: o_proj on FlashInfer's low-latency MXFP8 GEMM
+    # (fixed tactic per 8/16/32-row tile, weights loaded under PDL ahead of the attention output).
+    SGLANG_MINIMAX_M3_LOW_BATCH_OPROJ = EnvBool(False)
+    # Debug: also run the stock o_proj on eager low-batch calls and log the output error.
+    SGLANG_MINIMAX_M3_LOW_BATCH_OPROJ_COMPARE = EnvBool(False)
 
     # MiniMax-M3 sparse-attention toggles for ROCm.
     # Share one index top-k across every N sparse layers; 1 (default) disables

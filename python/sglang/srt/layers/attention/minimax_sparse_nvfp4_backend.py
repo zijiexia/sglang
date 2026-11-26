@@ -183,6 +183,15 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
                 v_scale=self.kv_pool.get_main_v_scale_buffer(layer.layer_id),
                 global_scale=self.kv_pool.main_pool.global_scale,
             )
+        if isinstance(out, tuple):
+            # MXFP8 o_proj input (E4M3 rows, 128x4-swizzled scales): padded rows
+            # are zero data under the scale buffer's zero padding.
+            data, scale = out
+            if total_q < q.shape[0]:
+                data = torch.cat(
+                    (data, data.new_zeros(q.shape[0] - total_q, data.shape[1]))
+                )
+            return None, (data, scale)
         if total_q < q.shape[0]:
             out = torch.cat((out, out.new_zeros(q.shape[0] - total_q, *out.shape[1:])))
         return None, out.reshape(q.shape[0], -1).contiguous()
@@ -196,6 +205,20 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
         self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
     ):
         return self._forward(q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
+
+    def _msa_v1_output_mxfp8(self, rows: int) -> bool:
+        """Whether the decode attention writes o_proj's MXFP8 input itself:
+        with the low-batch o_proj on (SGLANG_MINIMAX_M3_LOW_BATCH_OPROJ), at
+        its 1-32 rows, on the Q8KV4 kernel."""
+        from sglang.srt.models.minimax_common.nvidia.low_batch_attn_out import (
+            layer as low_batch_attn_out,
+        )
+
+        return (
+            low_batch_attn_out.enabled()
+            and 0 < rows <= low_batch_attn_out.MAX_ROWS
+            and self._msa_v1_qmul4_available
+        )
 
     def _prepare_msa_v1_decode_plan(
         self,
@@ -254,6 +277,7 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
                     device=forward_batch.seq_lens.device,
                     sm_scale=self.idx_head_dim**-0.5,
                     prefer_qmul4=self._msa_v1_qmul4_available,
+                    output_mxfp8=self._msa_v1_output_mxfp8(batch_size * query_length),
                     workspace_buffer=self._msa_v1_attention_workspace,
                     page_table_buffer=plan.page_table,
                     final_seq_lens_buffer=plan.final_seq_lens,
@@ -279,6 +303,7 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
                 device=forward_batch.seq_lens.device,
                 sm_scale=self.idx_head_dim**-0.5,
                 prefer_qmul4=self._msa_v1_qmul4_available,
+                output_mxfp8=self._msa_v1_output_mxfp8(batch_size * query_length),
                 workspace_buffer=self._msa_v1_attention_workspace,
             )
         if (
