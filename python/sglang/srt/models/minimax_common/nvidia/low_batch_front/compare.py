@@ -20,7 +20,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 PAGE = 128
-_calls = 0
+_calls: dict = {}  # logged calls per row count
 _E2M1 = None
 
 
@@ -43,7 +43,6 @@ def _stats(a: torch.Tensor, b: torch.Tensor) -> str:
 
 
 def log(layer, owed, residual, forward_batch, out, r_mid, kv, ik, slots) -> None:
-    global _calls
     from sglang.kernels.ops.attention.minimax_qknorm_rope import (
         minimax_qknorm_rope_grouped_fp8,
     )
@@ -140,11 +139,11 @@ def log(layer, owed, residual, forward_batch, out, r_mid, kv, ik, slots) -> None
         parts.append(
             f"{name} {_stats(_dequant(gc, gs), _dequant(rc, rs))} same={same:.4f}"
         )
-    _calls += 1
+    _calls[rows] = _calls.get(rows, 0) + 1
     cos_r = torch.nn.functional.cosine_similarity(
         r_mid.float().flatten(), res_ref.float().flatten(), dim=0
     ).item()
-    if _calls <= 200 or cos_r < 0.999:
+    if _calls[rows] <= 200 or cos_r < 0.999:
         logger.info(
             "fused front compare layer=%s rows=%d %s",
             layer.layer_id,
