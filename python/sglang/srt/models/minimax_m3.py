@@ -493,6 +493,10 @@ class MiniMaxM3MoE(nn.Module):
             hidden_size=config.hidden_size,
             weight_dtype=self.gate.weight.dtype,
         )
+        m3_router_cap = envs.SGLANG_MINIMAX_M3_TINY_ROUTER_MAX_TOKENS.get()
+        if m3_router_cap > 0 and self.tiny_router_gemm_max_tokens > 0:
+            # Above the generic cap cuBLAS splits K into a GEMM plus a reduce launch.
+            self.tiny_router_gemm_max_tokens = m3_router_cap
 
         self.layer_id = layer_id
         self.trtllm_decode_with_mega_moe = (
@@ -773,16 +777,46 @@ class MiniMaxM3MoE(nn.Module):
             ):
                 # N is num_local_experts, so cuBLAS splits K and runs the
                 # projection as two launches; the tiny GEMM does it in one.
-                return tiny_gemm_bf16(
+                logits = tiny_gemm_bf16(
                     hidden_states,
                     self.gate.weight,
                     out_dtype=torch.float32,
                 )
+                if (
+                    envs.SGLANG_MINIMAX_M3_LOW_BATCH_MOE_COMPARE.get()
+                    and not get_is_capture_mode()
+                ):
+                    self._log_router_compare(hidden_states, logits)
+                return logits
             return torch.mm(
                 hidden_states, self.gate.weight.t(), out_dtype=torch.float32
             )
         router_logits, _ = self.gate(hidden_states.to(torch.float32))
         return router_logits
+
+    def _log_router_compare(
+        self, hidden_states: torch.Tensor, logits: torch.Tensor
+    ) -> None:
+        """Debug: the tiny-GEMM router against cuBLAS, as routing sees it (top-k of
+        sigmoid + correction bias)."""
+        ref = torch.mm(hidden_states, self.gate.weight.t(), out_dtype=torch.float32)
+        bias = self.e_score_correction_bias
+        top_k = self.topk.topk_config.top_k
+        picks = [
+            (t.sigmoid() + (0 if bias is None else bias))
+            .topk(top_k, dim=-1)
+            .indices.sort(-1)
+            .values
+            for t in (logits, ref)
+        ]
+        logger.info(
+            "m3 router compare layer=%d rows=%d top%d_agree=%.4f max_abs=%.3e",
+            self.layer_id,
+            hidden_states.shape[0],
+            top_k,
+            (picks[0] == picks[1]).all(-1).float().mean().item(),
+            (logits - ref).abs().max().item(),
+        )
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
