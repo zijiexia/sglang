@@ -550,6 +550,16 @@ def _shared_or_new_int32(
     return shared
 
 
+def _decode_plan_takes_output_mode() -> bool:
+    """Whether the installed MSA Q8KV4 decode wrapper can write MXFP8 output."""
+    import inspect
+
+    return (
+        _DecodeAttentionWrapper is not None
+        and "output_mode" in inspect.signature(_DecodeAttentionWrapper.plan).parameters
+    )
+
+
 class MSAV1DecodeAttentionPlan:
     """Q8KV4 decode with a graph-safe Q8K8 gather/dequant fallback."""
 
@@ -564,6 +574,7 @@ class MSAV1DecodeAttentionPlan:
         device: torch.device,
         sm_scale: float,
         prefer_qmul4: bool,
+        output_mxfp8: bool = False,
         workspace_buffer: torch.Tensor | None = None,
         page_table_buffer: torch.Tensor | None = None,
         final_seq_lens_buffer: torch.Tensor | None = None,
@@ -626,7 +637,13 @@ class MSAV1DecodeAttentionPlan:
 
         self.qmul4_wrapper = None
         self.qmul4_fallback_reason = None
+        # The Q8KV4 kernel can write o_proj's MXFP8 input (E4M3 [rows, heads x 128],
+        # UE8M0 scales in FlashInfer's 128x4 swizzled layout) instead of BF16.
+        self.output_mxfp8 = False
         if prefer_qmul4 and self.gqa_group_size in (8, 16):
+            plan_kwargs = {}
+            if output_mxfp8 and _decode_plan_takes_output_mode():
+                plan_kwargs["output_mode"] = "mxfp8"
             try:
                 wrapper = _DecodeAttentionWrapper()
                 wrapper.plan(
@@ -637,8 +654,10 @@ class MSAV1DecodeAttentionPlan:
                     num_q_heads=self.num_q_heads,
                     num_kv_heads=self.num_kv_heads,
                     sm_scale=self.sm_scale,
+                    **plan_kwargs,
                 )
                 self.qmul4_wrapper = wrapper
+                self.output_mxfp8 = bool(plan_kwargs)
             except Exception as error:
                 self.qmul4_fallback_reason = str(error)
         elif prefer_qmul4:

@@ -1703,7 +1703,7 @@ class MiniMaxM3Attention(nn.Module):
             idx_o, attn_output = self.attn(
                 q, k, v, forward_batch, idx_q=idx_q, idx_k=idx_k, idx_v=idx_v, **extra
             )
-            output, _ = self.o_proj(attn_output)
+            output = self._o_proj(attn_output)
             if self.disable_index_value:
                 return output
             # Pre-divide idx_o (not the weight) so the TP all-reduce sums right.
@@ -1714,7 +1714,31 @@ class MiniMaxM3Attention(nn.Module):
 
         q, k, v, forward_batch = inner_state
         attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
+        return self._o_proj(attn_output)
+
+    def _o_proj(self, attn_output) -> torch.Tensor:
+        """o_proj, on the low-latency MXFP8 GEMM at 1-32 rows when
+        SGLANG_MINIMAX_M3_LOW_BATCH_OPROJ is set and the layer fits.
+        ``attn_output`` is BF16, or o_proj's MXFP8 input ``(data, scale)``
+        when the sparse decode attention wrote it (same flag)."""
+        from sglang.srt.models.minimax_common.nvidia.low_batch_attn_out import layer
+
+        rows = (
+            attn_output[0] if isinstance(attn_output, tuple) else attn_output
+        ).shape[0]
+        low_batch = None
+        if layer.enabled() and 0 < rows <= layer.MAX_ROWS:
+            low_batch = layer.get_low_batch_o_proj(self)
+        if low_batch is None:
+            output, _ = self.o_proj(attn_output)
+            return output
+        output = low_batch.run(attn_output)
+        if (
+            envs.SGLANG_MINIMAX_M3_LOW_BATCH_OPROJ_COMPARE.get()
+            and not get_is_capture_mode()
+        ):
+            ref, _ = self.o_proj(attn_output)
+            layer.log_compare(self, rows, output, ref)
         return output
 
     def forward(
