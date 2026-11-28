@@ -2947,6 +2947,16 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _hbm_segment_bytes(self) -> int:
+        # HBM donated to the Mooncake store is allocated after the KV pool.
+        if self.is_draft_worker or envs.MOONCAKE_HBM_SEGMENT_SIZE.get() in ("", "0"):
+            return 0
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            hbm_segment_bytes,
+        )
+
+        return hbm_segment_bytes()
+
     def _dflash_draft_kv_ring_bytes(self) -> int:
         if self.is_draft_worker or not get_spec().speculative_dflash_draft_kv_ring:
             return 0
@@ -3305,6 +3315,7 @@ class KVCacheConfigurator:
         if self.mambaish_config is not None and not get_memory().enable_unified_memory:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
         rest_memory -= self._dflash_draft_kv_ring_bytes() / (1 << 30)
+        rest_memory -= self._hbm_segment_bytes() / (1 << 30)
 
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:
