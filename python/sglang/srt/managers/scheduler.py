@@ -12,6 +12,7 @@
 # limitations under the License.
 # ======================================================================="""A scheduler that manages a tensor parallel GPU worker."""
 
+import atexit
 import dataclasses
 import faulthandler
 import logging
@@ -746,6 +747,9 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+
+        # Lend HBM to the Mooncake store from a worker with no store client
+        self.maybe_init_hbm_donor()
 
         # Init overlap schedule
         self.init_overlap()
@@ -2686,6 +2690,24 @@ class Scheduler(
             else self.tp_worker
         )
         return target_worker.model_runner
+
+    def maybe_init_hbm_donor(self) -> None:
+        self.hbm_donor = None
+        if envs.MOONCAKE_HBM_SEGMENT_SIZE.get() in ("", "0"):
+            return
+        memory = get_memory()
+        # A Mooncake store client on this worker mounts the segment itself.
+        if memory.hicache_storage_backend == "mooncake" or (
+            self.enable_unified_cache_external_linker
+            and memory.unified_cache_external_linker_backend == "mooncake"
+        ):
+            return
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeHbmDonor,
+        )
+
+        self.hbm_donor = MooncakeHbmDonor(tp_rank=get_parallel().tp_rank)
+        atexit.register(self.hbm_donor.close)
 
     def maybe_init_uocr_runtime(self) -> None:
         """Initialize Unlimited-OCR v2 split-document KV reuse and prefetch."""
