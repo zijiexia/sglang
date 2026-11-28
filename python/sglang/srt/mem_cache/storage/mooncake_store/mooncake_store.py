@@ -107,6 +107,68 @@ def hbm_segment_bytes() -> int:
     return size // _HBM_SEGMENT_ALIGN * _HBM_SEGMENT_ALIGN
 
 
+def _resolve_device_name(device_name: str, tp_rank: Optional[int]) -> str:
+    """Pick this rank's RDMA device from a JSON {tp_rank: device} mapping."""
+    if not device_name or not device_name.strip().startswith("{"):
+        return device_name
+    try:
+        device_config = json.loads(device_name)
+    except (json.JSONDecodeError, AttributeError):
+        logger.warning(f"Failed to parse device_name as JSON: {device_name}")
+        return ""
+    if tp_rank is None:
+        return ""
+    # Try both integer and string keys since JSON parsing may convert keys
+    return device_config.get(tp_rank, "") or device_config.get(str(tp_rank), "")
+
+
+def _mount_hbm_segment(store, protocol: str):
+    """Mount MOONCAKE_HBM_SEGMENT_SIZE of this device's HBM as a store segment.
+
+    Returns (tensor, segment_ids); the caller keeps the tensor alive until
+    the segments are unmounted, because the store never frees it.
+    """
+    size = hbm_segment_bytes()
+    if size == 0:
+        return None, []
+    if not hasattr(store, "mount_external_segment"):
+        raise RuntimeError(
+            "MOONCAKE_HBM_SEGMENT_SIZE is set, but the installed Mooncake "
+            "has no mount_external_segment()."
+        )
+    device = torch.cuda.current_device()
+    # Over-allocate so the mounted range starts on an aligned address.
+    buf = torch.empty(
+        size + _HBM_SEGMENT_ALIGN, dtype=torch.uint8, device=f"cuda:{device}"
+    )
+    base = -buf.data_ptr() % _HBM_SEGMENT_ALIGN + buf.data_ptr()
+    result = store.mount_external_segment(base, size, protocol, f"cuda:{device}")
+    if result["ret"] != 0:
+        raise RuntimeError(
+            f"Failed to mount {size} B HBM segment on cuda:{device}, "
+            f"ret={result['ret']}"
+        )
+    segment_ids = list(result["segment_ids"])
+    logger.info(
+        "Mounted %.1f GiB HBM segment on cuda:%d (%d segment(s)).",
+        size / (1 << 30),
+        device,
+        len(segment_ids),
+    )
+    return buf, segment_ids
+
+
+def _unmount_hbm_segment(store, segment_ids) -> bool:
+    """Returns whether the segment's tensor may be released."""
+    if not segment_ids:
+        return True
+    ret = store.unmount_segment(segment_ids)
+    if ret != 0:
+        logger.warning("Failed to unmount HBM segment, ret=%s", ret)
+        return False
+    return True
+
+
 def _normalize_tenant_id(value) -> str:
     if value is None:
         return DEFAULT_TENANT_ID
@@ -478,6 +540,39 @@ class MooncakeBaseStore:
             self.clear_request_context()
 
 
+class MooncakeHbmDonor(MooncakeBaseStore):
+    """Lends this worker's HBM to the Mooncake store without using the store.
+
+    For workers that run no store client of their own (e.g. PD decode): a
+    client with no host segment and no local buffer, which only mounts the
+    HBM segment. It issues no put or get.
+    """
+
+    def __init__(self, tp_rank: Optional[int] = None):
+        MooncakeBaseStore.__init__(self)
+        self.store = self._import_mooncake_store()()
+        self.config = self._load_config()
+        ret = self.store.setup(
+            self.config.local_hostname,
+            self.config.metadata_server,
+            0,
+            0,
+            self.config.protocol,
+            _resolve_device_name(self.config.device_name, tp_rank),
+            self.config.master_server_address,
+        )
+        if ret:
+            raise RuntimeError(f"Failed to setup Mooncake HBM donor, error code: {ret}")
+        self._hbm_segment, self._hbm_segment_ids = _mount_hbm_segment(
+            self.store, self.config.protocol
+        )
+
+    def close(self):
+        if _unmount_hbm_segment(self.store, self._hbm_segment_ids):
+            self._hbm_segment_ids = []
+            self._hbm_segment = None
+
+
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
@@ -597,23 +692,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.check_server()
 
             # Handle JSON device_name configuration
-            device_name = self.config.device_name
-            if device_name and device_name.strip().startswith("{"):
-                try:
-                    device_config = json.loads(device_name)
-                    if storage_config and hasattr(storage_config, "tp_rank"):
-                        tp_rank = storage_config.tp_rank
-                        # Try both integer and string keys since JSON parsing may convert keys
-                        device_name = device_config.get(tp_rank, "")
-                        if not device_name:
-                            device_name = device_config.get(str(tp_rank), "")
-                    else:
-                        device_name = ""
-                except (json.JSONDecodeError, AttributeError):
-                    logger.warning(
-                        f"Failed to parse device_name as JSON: {device_name}"
-                    )
-                    device_name = ""
+            device_name = _resolve_device_name(
+                self.config.device_name,
+                getattr(storage_config, "tp_rank", None) if storage_config else None,
+            )
             if self.config.standalone_storage:
                 if not isinstance(mem_pool.allocator, MooncakeHostTensorAllocator):
                     raise RuntimeError(
@@ -1823,49 +1905,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return len(query_keys) // key_multiplier
 
     def _mount_hbm_segment(self) -> None:
-        self._hbm_segment = None
-        self._hbm_segment_ids = []
-        size = hbm_segment_bytes()
-        if size == 0:
-            return
-        if not hasattr(self.store, "mount_external_segment"):
-            raise RuntimeError(
-                "MOONCAKE_HBM_SEGMENT_SIZE is set, but the installed Mooncake "
-                "has no mount_external_segment()."
-            )
-        device = torch.cuda.current_device()
-        # Over-allocate so the mounted range starts on an aligned address.
-        buf = torch.empty(
-            size + _HBM_SEGMENT_ALIGN, dtype=torch.uint8, device=f"cuda:{device}"
-        )
-        base = -buf.data_ptr() % _HBM_SEGMENT_ALIGN + buf.data_ptr()
-        result = self.store.mount_external_segment(
-            base, size, self.config.protocol, f"cuda:{device}"
-        )
-        if result["ret"] != 0:
-            raise RuntimeError(
-                f"Failed to mount {size} B HBM segment on cuda:{device}, "
-                f"ret={result['ret']}"
-            )
-        # The store never frees this memory; keep it alive until unmount.
-        self._hbm_segment = buf
-        self._hbm_segment_ids = list(result["segment_ids"])
-        logger.info(
-            "Mounted %.1f GiB HBM segment on cuda:%d (%d segment(s)).",
-            size / (1 << 30),
-            device,
-            len(self._hbm_segment_ids),
+        self._hbm_segment, self._hbm_segment_ids = _mount_hbm_segment(
+            self.store, self.config.protocol
         )
 
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
         # it is unnecessary to close it manually. Mounted HBM must be unmounted
         # before its tensor can be released.
-        if getattr(self, "_hbm_segment_ids", None):
-            ret = self.store.unmount_segment(self._hbm_segment_ids)
-            if ret != 0:
-                logger.warning("Failed to unmount HBM segment, ret=%s", ret)
-                return
+        if _unmount_hbm_segment(self.store, getattr(self, "_hbm_segment_ids", None)):
             self._hbm_segment_ids = []
             self._hbm_segment = None
 
