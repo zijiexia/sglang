@@ -207,6 +207,14 @@ def _bootstrap_addr(req: Req) -> str:
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
+def prealloc_cap_allows(cap: int, held_tokens: int, request_tokens: int) -> bool:
+    """Whether a request needing ``request_tokens`` may preallocate while
+    ``held_tokens`` are reserved for requests still receiving KV. ``cap <= 0``
+    disables the cap; with nothing held a request is always admitted, so one
+    larger than the cap still makes progress."""
+    return cap <= 0 or held_tokens <= 0 or held_tokens + request_tokens <= cap
+
+
 def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     """Start a decode-radix request that owns its whole KV row at the root."""
     req.prefix_len = 0
@@ -1753,6 +1761,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             running_loras.update(req.lora_id for req in self.transfer_queue.queue)
             running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
 
+        # Device KV held by requests still receiving, for the prealloc cap.
+        # Charged at the full fill length, so a decode-radix prefix hit counts
+        # against the cap even though its pages are shared.
+        prealloc_cap = envs.SGLANG_DISAGG_DECODE_MAX_PREALLOC_TOKENS.get()
+        held_prealloc_tokens = self.num_tokens_pre_allocated if prealloc_cap > 0 else 0
+
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -1807,6 +1821,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             fill_len = pre_alloc_fill_len(decode_req.req)
+            # Stop in queue order: skipping ahead would starve long requests.
+            if not prealloc_cap_allows(prealloc_cap, held_prealloc_tokens, fill_len):
+                break
             prefix_match: Optional[DecodePrefixMatch] = None
             use_decode_radix_cache = (
                 get_disagg().disaggregation_decode_enable_radix_cache
@@ -2020,6 +2037,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     fill_len=fill_len,
                 )
             num_device_preallocated += 1
+            held_prealloc_tokens += fill_len
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             if self.scheduler.enable_lora:

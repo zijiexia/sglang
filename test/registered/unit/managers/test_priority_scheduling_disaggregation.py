@@ -705,6 +705,60 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
             [reqs[0].req, reqs[2].req],
         )
 
+    def _cap_queue(self, lengths, held=()):
+        """FIFO queue of requests with the given prompt lengths, and a transfer
+        queue already holding requests of the ``held`` lengths."""
+        reqs = []
+        for i, length in enumerate(lengths):
+            entry = self._new_decode_req(f"r{i}", 0)
+            entry.req.origin_input_ids = list(range(length))
+            reqs.append(entry)
+        queue = self._new_queue(reqs)
+        queue.scheduler.enable_priority_scheduling = False
+        queue.scheduler.enable_decode_hicache = False
+        queue.transfer_queue.queue = decode_queue(
+            ListKind.PD_RECEIVING,
+            [
+                SimpleNamespace(req=FakeReq(extend_end=n), host_staged=False)
+                for n in held
+            ],
+        )
+        return queue, reqs
+
+    def _move_with_cap(self, queue, cap):
+        with (
+            envs.SGLANG_DISAGG_DECODE_MAX_PREALLOC_TOKENS.override(cap),
+            patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096),
+        ):
+            return queue.move_preallocated(queue.transfer_queue.queue)
+
+    def test_prealloc_cap_bounds_tokens_held_for_receiving_requests(self):
+        # (prompt lengths, held lengths, cap, admitted prefix)
+        cases = (
+            ((3, 3, 3), (), 0, 3),  # disabled
+            ((3, 3, 3), (), 6, 2),  # 3 + 3 fits, a third would not
+            ((3, 3, 3), (), 5, 1),
+            ((3, 3), (4,), 7, 1),  # charges what is already receiving
+            ((3, 3), (4,), 6, 0),
+            ((10, 3), (), 4, 1),  # nothing held: an oversized request runs alone
+            ((10, 3), (2,), 12, 1),  # 2 + 10 fills the cap
+        )
+        for lengths, held, cap, admitted in cases:
+            with self.subTest(lengths=lengths, held=held, cap=cap):
+                queue, reqs = self._cap_queue(lengths, held)
+                preallocated, failed = self._move_with_cap(queue, cap)
+                self.assertEqual(failed, [])
+                self.assertEqual(preallocated, reqs[:admitted])
+                self.assertEqual(list(queue.queue.items()), reqs[admitted:])
+
+    def test_prealloc_cap_keeps_queue_order(self):
+        """A small request does not pass a blocked large one: skipping ahead
+        would let a steady stream of short requests starve long ones."""
+        queue, reqs = self._cap_queue((8, 2), held=(4,))
+        preallocated, _ = self._move_with_cap(queue, 10)
+        self.assertEqual(preallocated, [])
+        self.assertEqual(list(queue.queue.items()), reqs)
+
     def test_prealloc_queue_schedules_higher_priority_values_first_by_default(self):
         reqs = [
             self._new_decode_req("low", 1),
