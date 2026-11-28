@@ -80,6 +80,10 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         preserve_media_metadata=True, preprocess_off_event_loop=True
     )
 
+    # Same text backbone (self.model): reuse the prefill autotune hook.
+    wants_prefill_autotune = MiniMaxM3SparseForCausalLM.wants_prefill_autotune
+    autotune_prefill_kernels = MiniMaxM3SparseForCausalLM.autotune_prefill_kernels
+
     def __init__(
         self,
         config,

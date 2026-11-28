@@ -5,7 +5,7 @@ import os
 import unittest
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from torch import nn
@@ -597,6 +597,74 @@ class TestMiniMaxM31Forward(CustomTestCase):
         self.assertFalse(stored_by_fusion(0.5, fp8))
         # a bf16 index cache ignores the scale on both paths
         self.assertTrue(stored_by_fusion(0.5, torch.bfloat16))
+
+
+class TestMiniMaxM31PrefillAutotune(CustomTestCase):
+    """The startup hook that tunes prefill-sized GEMMs and the routed MoE."""
+
+    @staticmethod
+    def _linear(n, k, *, mxfp8=True, cutedsl=True):
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+        method = Mock(spec=Fp8LinearMethod)
+        method.use_mxfp8 = mxfp8
+        method.mxfp8_dense_backend = Mock()
+        method.mxfp8_dense_backend.is_flashinfer_cutedsl.return_value = cutedsl
+        layer = nn.Module()
+        layer.weight = torch.empty(n, k)
+        layer.weight_scale_inv_swizzled = torch.empty(n * k // 32)
+        layer.quant_method = method
+        return layer
+
+    def _model(self, *modules):
+        return SimpleNamespace(
+            model=SimpleNamespace(modules=lambda: iter(modules)),
+            wants_prefill_autotune=partial(
+                minimax_m3.MiniMaxM3SparseForCausalLM.wants_prefill_autotune, None
+            ),
+        )
+
+    def test_tunes_each_layout_once_and_one_moe_layer(self):
+        same_a, same_b = self._linear(64, 32), self._linear(64, 32)
+        other = self._linear(32, 64)
+        skipped = [
+            self._linear(64, 64, mxfp8=False),
+            self._linear(64, 64, cutedsl=False),
+        ]
+        moes = [Mock(spec=minimax_m3.MiniMaxM3MoE) for _ in range(2)]
+        for moe in moes:
+            moe.gate = SimpleNamespace(weight=torch.empty(4, 32))
+        model = self._model(same_a, same_b, other, *skipped, *moes)
+        with envs.SGLANG_MINIMAX_M3_PREFILL_AUTOTUNE.override(True):
+            count = minimax_m3.MiniMaxM3SparseForCausalLM.autotune_prefill_kernels(
+                model, 256, dtype=torch.bfloat16
+            )
+        self.assertEqual(count, 3)
+        same_a.quant_method.apply.assert_called_once()
+        same_b.quant_method.apply.assert_not_called()
+        self.assertEqual(other.quant_method.apply.call_args.args[1].shape, (256, 64))
+        for layer in skipped:
+            layer.quant_method.apply.assert_not_called()
+        calls = moes[0]._forward_router_experts.call_args_list
+        self.assertEqual([c.kwargs["defer_finalize"] for c in calls], [True, False])
+        self.assertEqual(calls[0].args[0].shape, (256, 32))
+        moes[1]._forward_router_experts.assert_not_called()
+
+    def test_off_by_default(self):
+        layer = self._linear(64, 32)
+        model = self._model(layer)
+        with envs.SGLANG_MINIMAX_M3_PREFILL_AUTOTUNE.override(False):
+            count = minimax_m3.MiniMaxM3SparseForCausalLM.autotune_prefill_kernels(
+                model, 256, dtype=torch.bfloat16
+            )
+        self.assertEqual(count, 0)
+        layer.quant_method.apply.assert_not_called()
+
+    def test_multimodal_wrapper_exposes_the_hook(self):
+        cls = MiniMaxM3SparseForConditionalGeneration
+        base = minimax_m3.MiniMaxM3SparseForCausalLM
+        self.assertIs(cls.autotune_prefill_kernels, base.autotune_prefill_kernels)
+        self.assertIs(cls.wants_prefill_autotune, base.wants_prefill_autotune)
 
 
 class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
