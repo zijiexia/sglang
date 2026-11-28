@@ -2012,6 +2012,73 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
+    def wants_prefill_autotune(self) -> bool:
+        return envs.SGLANG_MINIMAX_M3_PREFILL_AUTOTUNE.get()
+
+    @torch.inference_mode()
+    def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
+        """Tune the MXFP8 dense linears and the routed MoE at ``num_tokens``.
+
+        The runner owns the autotune context; this only feeds each distinct
+        weight layout one prefill-sized input. The quant methods and the MoE
+        runner are called directly, so no collectives run and no request, KV or
+        draft state is touched.
+        """
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+        if not self.wants_prefill_autotune() or self.model is None:
+            return 0
+        seen = set()
+        for layer in self.model.modules():
+            # The fused QKV+index projection keeps its method as ``_qm``.
+            method = getattr(layer, "quant_method", None) or getattr(layer, "_qm", None)
+            if not isinstance(method, Fp8LinearMethod) or not method.use_mxfp8:
+                continue
+            backend = method.mxfp8_dense_backend
+            if backend is None or not backend.is_flashinfer_cutedsl():
+                continue
+            weight = layer.weight
+            if weight.numel() == 0:
+                continue
+            scale = layer.weight_scale_inv_swizzled
+            key = (
+                weight.shape,
+                weight.stride(),
+                weight.dtype,
+                scale.shape,
+                scale.stride(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            method.apply(
+                layer,
+                torch.zeros(
+                    (num_tokens, weight.shape[1]), dtype=dtype, device=weight.device
+                ),
+            )
+        # Every MoE layer has the same shape, so one layer tunes them all. Both
+        # finalize variants run, since serving uses either depending on the
+        # forward.
+        moe = next(
+            (m for m in self.model.modules() if isinstance(m, MiniMaxM3MoE)), None
+        )
+        if moe is not None:
+            hidden_states = torch.randn(
+                (num_tokens, moe.gate.weight.shape[1]),
+                dtype=dtype,
+                device=moe.gate.weight.device,
+            )
+            moe._forward_router_experts(hidden_states, defer_finalize=True)
+            moe._forward_router_experts(hidden_states, defer_finalize=False)
+        logger.info(
+            "MiniMax-M3 prefill autotune at M=%d: %d MXFP8 weight layouts, %s MoE.",
+            num_tokens,
+            len(seen),
+            "routed" if moe is not None else "no",
+        )
+        return len(seen) + (moe is not None)
+
     def __init__(
         self,
         config: PretrainedConfig,

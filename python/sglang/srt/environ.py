@@ -2449,6 +2449,10 @@ class Envs:
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
+    # MiniMax-M3: also autotune the MXFP8 dense linears and the routed MoE at the
+    # prefill token ceiling. The DSpark dummy forward is verify-shaped (a few
+    # rows), so prefill-sized GEMMs otherwise run FlashInfer's untuned default.
+    SGLANG_MINIMAX_M3_PREFILL_AUTOTUNE = EnvBool(False)
 
     # MiniMax-M3 sparse-attention toggles for ROCm.
     # Share one index top-k across every N sparse layers; 1 (default) disables
